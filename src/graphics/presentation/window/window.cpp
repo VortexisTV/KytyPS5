@@ -905,6 +905,12 @@ void WindowShutdown() {
 	}
 }
 
+void WindowEmergencySavePipelineCache() noexcept {
+	if (g_window != nullptr && g_window->render_context != nullptr) {
+		g_window->render_context->GetPipelineCache().EmergencySave();
+	}
+}
+
 static int WindowIconRead(void* user, char* data, int size) {
 	auto*    src        = static_cast<Common::File*>(user);
 	uint32_t bytes_read = 0;

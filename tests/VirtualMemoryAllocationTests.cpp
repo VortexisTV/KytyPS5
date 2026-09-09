@@ -1,5 +1,6 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/hostException.h"
 #include "common/logging/log.h"
 #include "common/subsystems.h"
 #include "common/threads.h"
@@ -12,12 +13,14 @@
 #include "loader/systemContent.h"
 
 #include <array>
+#include <atomic>
 #include <cinttypes>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <string>
+#include <thread>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -2508,6 +2511,495 @@ void TestModuleRelocationUsesWritableHostMapping() {
 
 } // namespace
 
+// RAGE (GTA V) drives its streaming heap with sceKernelBatchMap: fixed-address 64 KiB-granular
+// MAP_DIRECT entries, UNMAP entries that span several separately mapped pieces, and MAP_DIRECT
+// entries placed over addresses that are still mapped. Replay that pattern with a model of the
+// expected state and verify, after every batch, that the host mapping matches the model.
+struct ChurnRng {
+	uint64_t state;
+	explicit ChurnRng(uint64_t seed): state(seed != 0 ? seed : 0x9e3779b97f4a7c15ull) {}
+	uint64_t Next() {
+		state ^= state << 13u;
+		state ^= state >> 7u;
+		state ^= state << 17u;
+		return state;
+	}
+	uint64_t Below(uint64_t n) { return n == 0 ? 0 : Next() % n; }
+};
+
+struct ChurnOp {
+	int      op;
+	uint64_t start;
+	uint64_t offset;
+	uint64_t length;
+	int      result;
+};
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+static bool HostPageWritable(uint64_t vaddr) {
+	MEMORY_BASIC_INFORMATION info {};
+	if (VirtualQuery(reinterpret_cast<const void*>(vaddr), &info, sizeof(info)) == 0) {
+		return false;
+	}
+	if (info.State != MEM_COMMIT) {
+		return false;
+	}
+	const DWORD protect = info.Protect & 0xffu;
+	return protect == PAGE_READWRITE || protect == PAGE_EXECUTE_READWRITE ||
+	       protect == PAGE_WRITECOPY || protect == PAGE_EXECUTE_WRITECOPY;
+}
+
+static bool HostPageInaccessible(uint64_t vaddr) {
+	MEMORY_BASIC_INFORMATION info {};
+	if (VirtualQuery(reinterpret_cast<const void*>(vaddr), &info, sizeof(info)) == 0) {
+		return true;
+	}
+	return info.State != MEM_COMMIT;
+}
+#endif
+
+void TestRageStyleFixedBatchMapChurn() {
+	const char* test = "RageStyleFixedBatchMapChurn";
+
+	constexpr uint64_t PageSize     = 0x10000; // RAGE commits 64 KiB blocks
+	constexpr uint64_t VaBase       = 0x1600000000ull;
+	constexpr uint64_t VaPages      = 192;
+	constexpr uint64_t DmemPages    = VaPages * 2;
+	constexpr int      Prot         = 0xf3; // CPU RW | GPU RW | AMPR RW, as GTA V passes it
+	constexpr int      MapDirectOp  = 0;
+	constexpr int      UnmapOp      = 1;
+	constexpr int      MaxBatch     = 24;
+	constexpr int      Iterations   = 1500;
+	const uint64_t     seed         = 0x47544135ull; // "GTA5"
+
+	int64_t dmem = -1;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            0, static_cast<int64_t>(Libs::LibKernel::Memory::KernelGetDirectMemorySize()),
+	            DmemPages * PageSize, PageSize, SceKernelMtypeC, &dmem),
+	        "KernelAllocateDirectMemory");
+	const auto dmem_base = static_cast<uint64_t>(dmem);
+
+	// Model: for every VA page, the dmem page currently mapped there (or -1).
+	std::vector<int64_t> va_to_dmem(VaPages, -1);
+	// Model: for every dmem page, whether it is mapped somewhere, and the marker it holds.
+	std::vector<bool>     dmem_used(DmemPages, false);
+	std::vector<uint64_t> dmem_marker(DmemPages, 0);
+	std::vector<ChurnOp>  history;
+	ChurnRng              rng(seed);
+
+	auto report_history = [&](const char* why) {
+		std::fprintf(stderr, "%s: %s (seed=0x%" PRIx64 ")\n", test, why, seed);
+		const size_t first = history.size() > 40 ? history.size() - 40 : 0;
+		for (size_t i = first; i < history.size(); i++) {
+			const auto& h = history[i];
+			std::fprintf(stderr, "  [%zu] %s start=0x%" PRIx64 " offset=0x%" PRIx64
+			                     " length=0x%" PRIx64 " result=0x%08x\n",
+			             i, h.op == MapDirectOp ? "MAP_DIRECT" : "UNMAP", h.start, h.offset,
+			             h.length, static_cast<uint32_t>(h.result));
+		}
+	};
+
+	auto pick_free_dmem_run = [&](uint64_t pages) -> int64_t {
+		// Find a random contiguous run of free dmem pages.
+		const uint64_t start_at = rng.Below(DmemPages);
+		for (uint64_t attempt = 0; attempt < DmemPages; attempt++) {
+			const uint64_t d = (start_at + attempt) % DmemPages;
+			if (d + pages > DmemPages) {
+				continue;
+			}
+			bool free = true;
+			for (uint64_t k = 0; k < pages; k++) {
+				if (dmem_used[d + k]) {
+					free = false;
+					break;
+				}
+			}
+			if (free) {
+				return static_cast<int64_t>(d);
+			}
+		}
+		return -1;
+	};
+
+	auto verify = [&](const char* phase) {
+		for (uint64_t p = 0; p < VaPages; p++) {
+			const uint64_t vaddr = VaBase + p * PageSize;
+			const int64_t  d     = va_to_dmem[p];
+			VirtualQueryInfo info {};
+			const int query = Libs::LibKernel::Memory::KernelVirtualQuery(
+			    reinterpret_cast<void*>(vaddr), 0, &info, sizeof(info));
+			if (d >= 0) {
+				const uint64_t expected_offset = dmem_base + static_cast<uint64_t>(d) * PageSize;
+				if (query != OK || info.is_direct == 0 ||
+				    info.offset + (vaddr - info.start) != expected_offset) {
+					char buffer[256];
+					std::snprintf(buffer, sizeof(buffer),
+					              "%s: page 0x%" PRIx64 " should be direct-mapped to 0x%" PRIx64
+					              " (query=0x%08x direct=%u offset=0x%" PRIx64 ")",
+					              phase, vaddr, expected_offset, static_cast<uint32_t>(query),
+					              info.is_direct, info.offset);
+					report_history(buffer);
+					Fail(test, buffer);
+				}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+				if (!HostPageWritable(vaddr)) {
+					char buffer[256];
+					std::snprintf(buffer, sizeof(buffer),
+					              "%s: page 0x%" PRIx64 " is mapped in the model but not writable on "
+					              "the host",
+					              phase, vaddr);
+					report_history(buffer);
+					Fail(test, buffer);
+				}
+#endif
+				uint64_t value = 0;
+				if (!Libs::LibKernel::Memory::TryReadBacking(vaddr, &value, sizeof(value)) ||
+				    value != dmem_marker[static_cast<size_t>(d)]) {
+					char buffer[256];
+					std::snprintf(buffer, sizeof(buffer),
+					              "%s: page 0x%" PRIx64 " content 0x%" PRIx64
+					              " does not match dmem page %" PRId64 " marker 0x%" PRIx64,
+					              phase, vaddr, value, d, dmem_marker[static_cast<size_t>(d)]);
+					report_history(buffer);
+					Fail(test, buffer);
+				}
+			} else {
+				if (query == OK && info.is_direct != 0 && vaddr >= info.start &&
+				    vaddr < info.end) {
+					char buffer[256];
+					std::snprintf(buffer, sizeof(buffer),
+					              "%s: page 0x%" PRIx64 " should be unmapped but queries as direct",
+					              phase, vaddr);
+					report_history(buffer);
+					Fail(test, buffer);
+				}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+				if (!HostPageInaccessible(vaddr)) {
+					char buffer[256];
+					std::snprintf(buffer, sizeof(buffer),
+					              "%s: page 0x%" PRIx64 " should be unmapped but is committed on the "
+					              "host",
+					              phase, vaddr);
+					report_history(buffer);
+					Fail(test, buffer);
+				}
+#endif
+			}
+		}
+	};
+
+	for (int iteration = 0; iteration < Iterations; iteration++) {
+		std::vector<Libs::LibKernel::Memory::KernelBatchMapEntry> entries;
+		std::vector<int64_t>                                       entry_dmem;
+		const int batch_size = 1 + static_cast<int>(rng.Below(MaxBatch));
+		// Working copy of the model so later entries in the same batch see earlier ones.
+		auto model_va   = va_to_dmem;
+		auto model_used = dmem_used;
+		for (int i = 0; i < batch_size; i++) {
+			Libs::LibKernel::Memory::KernelBatchMapEntry entry {};
+			const uint64_t                               roll = rng.Below(100);
+			if (roll < 55) {
+				// MAP_DIRECT of 1..16 pages; may land on pages that are still mapped.
+				const uint64_t pages = 1 + rng.Below(16);
+				const uint64_t page  = rng.Below(VaPages - pages + 1);
+				int64_t        d     = -1;
+				{
+					const uint64_t start_at = rng.Below(DmemPages);
+					for (uint64_t attempt = 0; attempt < DmemPages && d < 0; attempt++) {
+						const uint64_t cand = (start_at + attempt) % DmemPages;
+						if (cand + pages > DmemPages) {
+							continue;
+						}
+						bool free = true;
+						for (uint64_t k = 0; k < pages; k++) {
+							if (model_used[cand + k]) {
+								free = false;
+								break;
+							}
+						}
+						if (free) {
+							d = static_cast<int64_t>(cand);
+						}
+					}
+				}
+				if (d < 0) {
+					continue;
+				}
+				for (uint64_t k = 0; k < pages; k++) {
+					const int64_t old = model_va[page + k];
+					if (old >= 0) {
+						model_used[static_cast<size_t>(old)] = false;
+					}
+					model_va[page + k]                          = d + static_cast<int64_t>(k);
+					model_used[static_cast<size_t>(d) + k] = true;
+				}
+				entry.start      = reinterpret_cast<void*>(VaBase + page * PageSize);
+				entry.offset     = dmem_base + static_cast<uint64_t>(d) * PageSize;
+				entry.length     = pages * PageSize;
+				entry.protection = static_cast<unsigned char>(Prot);
+				entry.type       = 0;
+				entry.operation  = MapDirectOp;
+				entries.push_back(entry);
+				entry_dmem.push_back(d);
+			} else {
+				// UNMAP of a contiguous run of mapped pages (may span several mappings).
+				const uint64_t page = rng.Below(VaPages);
+				if (model_va[page] < 0) {
+					continue;
+				}
+				uint64_t pages = 0;
+				while (page + pages < VaPages && model_va[page + pages] >= 0 && pages < 16) {
+					pages++;
+				}
+				pages = 1 + rng.Below(pages);
+				for (uint64_t k = 0; k < pages; k++) {
+					model_used[static_cast<size_t>(model_va[page + k])] = false;
+					model_va[page + k]                                  = -1;
+				}
+				entry.start      = reinterpret_cast<void*>(VaBase + page * PageSize);
+				entry.offset     = 0;
+				entry.length     = pages * PageSize;
+				entry.protection = 0;
+				entry.type       = 0;
+				entry.operation  = UnmapOp;
+				entries.push_back(entry);
+				entry_dmem.push_back(-1);
+			}
+		}
+		if (entries.empty()) {
+			continue;
+		}
+
+		int       processed = -1;
+		const int result    = Libs::LibKernel::Memory::KernelBatchMap(
+		    entries.data(), static_cast<int>(entries.size()), &processed);
+		for (size_t i = 0; i < entries.size(); i++) {
+			history.push_back({entries[i].operation, reinterpret_cast<uint64_t>(entries[i].start),
+			                   entries[i].offset, entries[i].length,
+			                   static_cast<int>(i) < processed ? OK : result});
+		}
+		if (result != OK || processed != static_cast<int>(entries.size())) {
+			char buffer[256];
+			std::snprintf(buffer, sizeof(buffer),
+			              "iteration %d: KernelBatchMap returned 0x%08x after %d of %zu entries",
+			              iteration, static_cast<uint32_t>(result), processed, entries.size());
+			report_history(buffer);
+			Fail(test, buffer);
+		}
+		va_to_dmem = model_va;
+		dmem_used  = model_used;
+
+		// Stamp every freshly mapped dmem page through its new address, as the streamer would.
+		for (size_t i = 0; i < entries.size(); i++) {
+			if (entries[i].operation != MapDirectOp) {
+				continue;
+			}
+			const uint64_t pages = entries[i].length / PageSize;
+			for (uint64_t k = 0; k < pages; k++) {
+				const uint64_t vaddr = reinterpret_cast<uint64_t>(entries[i].start) + k * PageSize;
+				const auto     d     = static_cast<size_t>(entry_dmem[i]) + k;
+				// Only stamp if this page still maps that dmem page (a later entry may have
+				// replaced it).
+				const uint64_t va_page = (vaddr - VaBase) / PageSize;
+				if (va_to_dmem[va_page] != static_cast<int64_t>(d)) {
+					continue;
+				}
+				const uint64_t marker = (static_cast<uint64_t>(iteration) << 32u) | (d << 4u) | 1u;
+				*reinterpret_cast<volatile uint64_t*>(vaddr) = marker;
+				dmem_marker[d]                                = marker;
+			}
+		}
+
+		char phase[64];
+		std::snprintf(phase, sizeof(phase), "iteration %d", iteration);
+		verify(phase);
+	}
+
+	// Tear down whatever is still mapped so later tests start clean.
+	for (uint64_t p = 0; p < VaPages;) {
+		if (va_to_dmem[p] < 0) {
+			p++;
+			continue;
+		}
+		uint64_t pages = 0;
+		while (p + pages < VaPages && va_to_dmem[p + pages] >= 0) {
+			pages++;
+		}
+		CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(VaBase + p * PageSize, pages * PageSize),
+		        "KernelMunmap(teardown)");
+		p += pages;
+	}
+	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(dmem, DmemPages * PageSize),
+	        "KernelReleaseDirectMemory");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+// GTA V re-commits 64 KiB pages that are already committed at the same direct-memory offset.
+// That must keep the live mapping and its contents instead of tearing it down and rebuilding it.
+void TestFixedRemapOfIdenticalDirectMappingKeepsPage() {
+	const char*        test    = "FixedRemapOfIdenticalDirectMappingKeepsPage";
+	constexpr uint64_t size    = 0x10000;
+	constexpr uint64_t vaddr   = 0x1610000000ull;
+	constexpr int      prot_rw = SceKernelProtCpuRead | SceKernelProtCpuRw | 0x30;
+	constexpr int      prot_ro = SceKernelProtCpuRead | 0x10;
+	constexpr uint64_t marker  = 0x4b59545952414745ull;
+
+	int64_t dmem = -1;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            0, static_cast<int64_t>(Libs::LibKernel::Memory::KernelGetDirectMemorySize()),
+	            size, size, SceKernelMtypeC, &dmem),
+	        "KernelAllocateDirectMemory");
+
+	void* addr = reinterpret_cast<void*>(vaddr);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapDirectMemory(&addr, size, prot_rw, SceKernelMapFixed,
+	                                                       dmem, 0),
+	        "KernelMapDirectMemory(first)");
+	auto* word = reinterpret_cast<volatile uint64_t*>(vaddr);
+	*word      = marker;
+
+	addr = reinterpret_cast<void*>(vaddr);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapDirectMemory(&addr, size, prot_rw, SceKernelMapFixed,
+	                                                       dmem, 0),
+	        "KernelMapDirectMemory(identical)");
+	Check(test, reinterpret_cast<uint64_t>(addr) == vaddr, "identical remap moved the mapping");
+	Check(test, *word == marker, "identical remap lost the page contents");
+	VirtualQueryInfo info {};
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelVirtualQuery(reinterpret_cast<void*>(vaddr), 0, &info,
+	                                                    sizeof(info)),
+	        "KernelVirtualQuery(identical)");
+	Check(test,
+	      info.is_direct != 0 && info.offset == static_cast<uint64_t>(dmem) &&
+	          info.protection == prot_rw,
+	      "identical remap changed the mapping's query state");
+
+	addr = reinterpret_cast<void*>(vaddr);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapDirectMemory(&addr, size, prot_ro, SceKernelMapFixed,
+	                                                       dmem, 0),
+	        "KernelMapDirectMemory(read-only)");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelVirtualQuery(reinterpret_cast<void*>(vaddr), 0, &info,
+	                                                    sizeof(info)),
+	        "KernelVirtualQuery(read-only)");
+	Check(test, info.protection == prot_ro && *word == marker,
+	      "protection-only remap did not apply the new protection");
+
+	addr = reinterpret_cast<void*>(vaddr);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapDirectMemory(&addr, size, prot_rw, SceKernelMapFixed,
+	                                                       dmem, 0),
+	        "KernelMapDirectMemory(read-write)");
+	*word = marker + 1;
+	Check(test, *word == marker + 1, "read-write remap left the page read-only");
+
+	// The crash-time report must work on a mapped page and on one past the mapping, without
+	// blocking on any memory-manager lock.
+	Check(test, !Libs::LibKernel::Memory::WaitForMappingTransition(vaddr),
+	      "an idle page reported a mapping transition");
+	Libs::LibKernel::Memory::DumpGuestMemoryState(vaddr + 0x1234);
+	Libs::LibKernel::Memory::DumpGuestMemoryState(vaddr + size);
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(vaddr, size), "KernelMunmap");
+	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(dmem, size),
+	        "KernelReleaseDirectMemory");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+namespace {
+
+std::atomic<uint32_t> g_transition_waits {0};
+
+bool TransitionFaultHandler(const Common::HostException::ExceptionInfo& info) {
+	if (info.type == Common::HostException::ExceptionType::AccessViolation &&
+	    Libs::LibKernel::Memory::WaitForMappingTransition(info.access_violation_vaddr)) {
+		g_transition_waits.fetch_add(1, std::memory_order_relaxed);
+		return true;
+	}
+	return false;
+}
+
+struct WriterJoiner {
+	std::atomic<bool>& stop;
+	std::thread&       thread;
+	~WriterJoiner() {
+		stop.store(true, std::memory_order_relaxed);
+		if (thread.joinable()) {
+			thread.join();
+		}
+	}
+};
+
+} // namespace
+
+// One thread replaces a fixed direct mapping with different physical pages while another thread
+// keeps writing to it, as RAGE's streamer and main thread do. The replacement briefly unmaps the
+// page on the host; the fault handler must wait for it instead of reporting an unmapped access.
+void TestConcurrentFixedRemapWaitsForTransition() {
+	const char*        test  = "ConcurrentFixedRemapWaitsForTransition";
+	constexpr uint64_t size  = 0x10000;
+	constexpr uint64_t vaddr = 0x1620000000ull;
+	constexpr int      prot  = SceKernelProtCpuRead | SceKernelProtCpuRw;
+
+	int64_t dmem = -1;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            0, static_cast<int64_t>(Libs::LibKernel::Memory::KernelGetDirectMemorySize()),
+	            size * 2, size, SceKernelMtypeC, &dmem),
+	        "KernelAllocateDirectMemory");
+	const int64_t first  = dmem;
+	const int64_t second = dmem + static_cast<int64_t>(size);
+
+	void* addr = reinterpret_cast<void*>(vaddr);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapDirectMemory(&addr, size, prot, SceKernelMapFixed,
+	                                                       first, 0),
+	        "KernelMapDirectMemory(initial)");
+	Check(test, Common::HostException::InstallHandler(TransitionFaultHandler),
+	      "failed to install the host fault handler");
+
+	std::atomic<bool>     stop {false};
+	std::atomic<uint64_t> writes {0};
+	std::thread           writer([&stop, &writes]() {
+		auto*    word  = reinterpret_cast<volatile uint64_t*>(vaddr);
+		uint64_t value = 0;
+		while (!stop.load(std::memory_order_relaxed)) {
+			*word = value++;
+			writes.fetch_add(1, std::memory_order_relaxed);
+		}
+	});
+	WriterJoiner joiner {stop, writer};
+
+	for (int i = 0; i < 300; i++) {
+		addr = reinterpret_cast<void*>(vaddr);
+		CheckOk(test,
+		        Libs::LibKernel::Memory::KernelMapDirectMemory(&addr, size, prot, SceKernelMapFixed,
+		                                                       second, 0),
+		        "KernelMapDirectMemory(second)");
+		addr = reinterpret_cast<void*>(vaddr);
+		CheckOk(test,
+		        Libs::LibKernel::Memory::KernelMapDirectMemory(&addr, size, prot, SceKernelMapFixed,
+		                                                       first, 0),
+		        "KernelMapDirectMemory(first)");
+	}
+	stop.store(true, std::memory_order_relaxed);
+	writer.join();
+	Check(test, writes.load(std::memory_order_relaxed) > 0, "the writer thread never ran");
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(vaddr, size), "KernelMunmap");
+	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(dmem, size * 2),
+	        "KernelReleaseDirectMemory");
+
+	std::printf("[host]    %-48s ok (%u faults waited for a remap)\n", test,
+	            g_transition_waits.load(std::memory_order_relaxed));
+}
+
 int main(int argc, char** argv) {
 	InitSubsystems();
 	if (argc == 2 && std::strcmp(argv[1], "--red-zone-patcher-only") == 0) {
@@ -2563,6 +3055,9 @@ int main(int argc, char** argv) {
 	RunTest(TestMemoryPoolCommitDecommitQueryFlags);
 	RunTest(TestProgramMemoryAllocationAndProtection);
 	RunTest(TestModuleRelocationUsesWritableHostMapping);
+	RunTest(TestRageStyleFixedBatchMapChurn);
+	RunTest(TestFixedRemapOfIdenticalDirectMappingKeepsPage);
+	RunTest(TestConcurrentFixedRemapWaitsForTransition);
 
 	if (g_failed_tests != 0) {
 		std::printf("VirtualMemoryAllocationTests: %d case(s) failed\n", g_failed_tests);

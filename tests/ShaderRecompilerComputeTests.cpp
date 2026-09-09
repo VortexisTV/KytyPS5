@@ -3839,6 +3839,17 @@ public:
       cache.ReadMemory(base + reacquire_disjoint_offset,
                        sizeof(reacquire_value));
 
+      // The host reports one faulting byte. A store to the last bytes of a mapping whose
+      // neighbour is unmapped must be resolved, and one byte past the end must not be.
+      constexpr uint64_t mapped_end = base + allocation_size;
+      Require(name, "fault boundary containment",
+              resources.IsMapped(mapped_end - sizeof(uint32_t), sizeof(uint32_t)) &&
+                  !resources.IsMapped(mapped_end - sizeof(uint32_t), sizeof(uint64_t)) &&
+                  resources.HandleFault(PageFaultAccess::Write, mapped_end - 1) &&
+                  !resources.HandleFault(PageFaultAccess::Write, mapped_end) &&
+                  !resources.HandleFault(PageFaultAccess::Read, mapped_end),
+              "a store to the final mapped byte was rejected as unmapped");
+
       resources.SetGpu(nullptr);
       resources.UnmapMemory(base, allocation_size);
       scheduler.Finish();
