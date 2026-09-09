@@ -46,8 +46,11 @@ std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties)
 		uuid[i * 2]     = hex[properties.pipelineCacheUUID[i] >> 4u];
 		uuid[i * 2 + 1] = hex[properties.pipelineCacheUUID[i] & 0xfu];
 	}
-	return fmt::format("KytyPC1:{}:{:08x}:{:08x}:{:08x}:{}\n", KYTY_GIT_REVISION,
-	                   properties.vendorID, properties.deviceID, properties.driverVersion, uuid);
+	// The driver validates the blob itself (pipelineCacheUUID) and keys its entries by shader and
+	// state contents, so the cache stays valid across emulator revisions. Tying it to one revision
+	// threw away everything the game had compiled on every update.
+	return fmt::format("KytyPC2:{:08x}:{:08x}:{:08x}:{}\n", properties.vendorID,
+	                   properties.deviceID, properties.driverVersion, uuid);
 }
 
 std::string PipelineCacheTitleId() {
@@ -439,7 +442,7 @@ struct PipelineCache::ProgramCache {
 
 	template <typename InputInfo>
 	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info, uint32_t& push_data_cursor,
-	                  bool allow_async = true, bool translation_only = false) {
+	                  bool allow_async = true) {
 		constexpr ShaderType stage = StageOf<InputInfo>();
 		if (enqueue) {
 			DrainCompleted();
@@ -451,9 +454,6 @@ struct PipelineCache::ProgramCache {
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
 		auto                                         entry = programs.find(lookup_key);
-		if (translation_only && entry != programs.end()) {
-			return {};
-		}
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		const ShaderRecompiler::IR::SrtRuntime       runtime {
@@ -531,16 +531,6 @@ struct PipelineCache::ProgramCache {
 		return permutation.handle;
 	}
 
-	template <typename InputInfo>
-	void QueueSourceTranslation(const ShaderParams& params, InputInfo input_info) {
-		if (!enqueue) {
-			return;
-		}
-		uint32_t ignored_push_data_cursor = 0;
-		(void)Get(params, input_info, ignored_push_data_cursor, /*allow_async=*/true,
-		          /*translation_only=*/true);
-	}
-
 	explicit ProgramCache(vk::Device device): device(device) {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
@@ -582,6 +572,37 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 	if (m_async) {
 		StartWorkers();
 		m_program_cache->enqueue = [this](std::function<void()> job) { EnqueueJob(std::move(job)); };
+	}
+	if (m_driver_cache != nullptr) {
+		StartSaver();
+	}
+}
+
+void PipelineCache::StartSaver() {
+	m_saver = std::jthread([this] {
+		std::unique_lock lock(m_saver_mutex);
+		for (;;) {
+			// A session that ends in a crash or a forced exit would otherwise lose everything
+			// compiled since launch; write what is new every half minute.
+			if (m_saver_wake.wait_for(lock, std::chrono::seconds(30),
+			                          [this] { return m_stop_saver; })) {
+				return;
+			}
+			lock.unlock();
+			SaveSnapshot();
+			lock.lock();
+		}
+	});
+}
+
+void PipelineCache::StopSaver() {
+	{
+		std::lock_guard lock(m_saver_mutex);
+		m_stop_saver = true;
+	}
+	m_saver_wake.notify_all();
+	if (m_saver.joinable()) {
+		m_saver.join();
 	}
 }
 
@@ -640,6 +661,7 @@ void PipelineCache::DrainCompletedPipelines() {
 }
 
 PipelineCache::~PipelineCache() {
+	StopSaver();
 	if (m_async) {
 		StopWorkers();
 		DrainCompletedPipelines();
@@ -753,11 +775,59 @@ void PipelineCache::InitializeDriverCache() {
 }
 
 void PipelineCache::Save() {
-	Common::LockGuard lock(m_mutex);
+	StopSaver();
+	std::lock_guard lock(m_save_mutex);
 	if (m_driver_cache == nullptr) {
 		return;
 	}
+	if (m_pipelines_created.load(std::memory_order_acquire) != m_pipelines_saved &&
+	    WriteDriverCache()) {
+		m_pipelines_saved = m_pipelines_created.load(std::memory_order_acquire);
+	}
+	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
+	m_driver_cache = nullptr;
+}
 
+void PipelineCache::SaveSnapshot() {
+	std::lock_guard lock(m_save_mutex);
+	if (m_driver_cache == nullptr) {
+		return;
+	}
+	const auto created = m_pipelines_created.load(std::memory_order_acquire);
+	if (created == m_pipelines_saved) {
+		return;
+	}
+	if (WriteDriverCache()) {
+		m_pipelines_saved = created;
+	}
+}
+
+void PipelineCache::EmergencySave() noexcept {
+	if (m_driver_cache == nullptr) {
+		return; // disabled, or already written and released by Save()
+	}
+	// Other threads may be inside the driver or holding the save lock when the process dies on
+	// a fault. Do the work on a helper and give it a bounded time so a wedged driver cannot turn
+	// the crash into a hang.
+	auto        done = std::make_shared<std::atomic<bool>>(false);
+	std::thread worker([this, done] {
+		SaveSnapshot();
+		done->store(true, std::memory_order_release);
+	});
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+	while (!done->load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(5));
+	}
+	if (done->load(std::memory_order_acquire)) {
+		worker.join();
+	} else {
+		PipelineCacheLog("Vulkan pipeline cache: emergency save did not finish in time");
+		worker.detach();
+	}
+}
+
+// Caller holds m_save_mutex and m_driver_cache is valid.
+bool PipelineCache::WriteDriverCache() {
 	size_t               size = 0;
 	vk::Result           result;
 	std::vector<uint8_t> payload;
@@ -778,7 +848,7 @@ void PipelineCache::Save() {
 	    size > std::numeric_limits<uint32_t>::max()) {
 		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {} bytes)",
 		                 VulkanToString(result), size);
-		return;
+		return false;
 	}
 	payload.resize(size);
 	auto       prefix       = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
@@ -786,7 +856,7 @@ void PipelineCache::Save() {
 	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
 	if (!Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
-		return;
+		return false;
 	}
 	auto temp_path = m_driver_cache_path;
 	temp_path += ".tmp";
@@ -803,12 +873,11 @@ void PipelineCache::Save() {
 	    !Common::File::RenameFile(temp_path, m_driver_cache_path)) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to write {}",
 		                 Common::PathToString(m_driver_cache_path));
-		return;
+		return false;
 	}
 	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
 	                 Common::PathToString(m_driver_cache_path));
-	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
-	m_driver_cache = nullptr;
+	return true;
 }
 
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
@@ -841,9 +910,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	if (pixel_active) {
 		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
 		if (!result.pixel) {
-			// The vertex permutation cannot be compiled until the pixel layout establishes its
-			// push-data cursor, but its source translation is independent and can run in parallel.
-			m_program_cache->QueueSourceTranslation(vertex_params, vertex_info);
+			// Still compiling; the vertex lookup would otherwise bake a wrong push-data cursor.
 			return result;
 		}
 	}
@@ -1068,6 +1135,7 @@ PipelineCache::GraphicsPipeline* PipelineCache::CreateGraphicsPipeline(
 			                       static_params, m_driver_cache, m_graphics_library_cache.get());
 			EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 			EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
+			m_pipelines_created.fetch_add(1, std::memory_order_acq_rel);
 			std::lock_guard lock(m_completed_mutex);
 			m_completed_pipelines.push_back({std::move(key), std::move(cached)});
 		});
@@ -1094,6 +1162,7 @@ PipelineCache::GraphicsPipeline* PipelineCache::CreateGraphicsPipeline(
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
+	m_pipelines_created.fetch_add(1, std::memory_order_acq_rel);
 
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 	EXIT_IF(!inserted);
@@ -1131,6 +1200,7 @@ PipelineCache::CreateComputePipeline(ShaderComputeInputInfo& input_info,
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
+	m_pipelines_created.fetch_add(1, std::memory_order_acq_rel);
 
 	auto [iter, inserted] = m_compute_pipelines.emplace(std::move(key), std::move(cached));
 	EXIT_IF(!inserted);

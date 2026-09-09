@@ -75,6 +75,11 @@ void Shutdown() {
 	g_renderer = nullptr;
 }
 
+void EmergencyShutdown() {
+	// A crash used to discard every pipeline compiled since launch; keep them for the next run.
+	WindowEmergencySavePipelineCache();
+}
+
 void GraphicsDbgDumpDcb(const char* type, uint32_t num_dw, const uint32_t* cmd_buffer) {
 	EXIT_IF(type == nullptr);
 

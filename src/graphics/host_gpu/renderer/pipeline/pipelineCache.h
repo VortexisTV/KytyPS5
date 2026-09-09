@@ -9,6 +9,8 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/shader.h"
 
+#include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <deque>
@@ -135,7 +137,14 @@ public:
 	explicit PipelineCache(GraphicContext& graphics);
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
+	// Final save at shutdown: writes the driver cache and releases it.
 	void Save();
+	// Write the driver cache to disk when pipelines were added since the last write. Safe from
+	// any thread while the cache stays in use; the background saver calls it periodically.
+	void SaveSnapshot();
+	// Best-effort save from a thread that is about to terminate the process on a fault: bounded
+	// in time and never blocks on the crashing thread's own state.
+	void EmergencySave() noexcept;
 
 	struct Pipeline {
 		vk::PipelineLayout      pipeline_layout       = nullptr;
@@ -289,7 +298,21 @@ private:
 	bool                                                             m_stop_workers = false;
 	bool                                                             m_async        = false;
 
+	// Periodic and emergency saves of the driver cache. m_pipelines_created counts pipelines that
+	// were really built (and therefore added to the driver cache); a save is only worth it when
+	// it moved past m_pipelines_saved.
+	std::mutex              m_save_mutex;
+	std::atomic<uint64_t>   m_pipelines_created {0};
+	uint64_t                m_pipelines_saved = 0; // guarded by m_save_mutex
+	std::jthread            m_saver;
+	std::mutex              m_saver_mutex;
+	std::condition_variable m_saver_wake;
+	bool                    m_stop_saver = false; // guarded by m_saver_mutex
+
 	void InitializeDriverCache();
+	bool WriteDriverCache();
+	void StartSaver();
+	void StopSaver();
 	void StartWorkers();
 	void StopWorkers();
 	void EnqueueJob(std::function<void()> job);

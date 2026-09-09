@@ -68,6 +68,7 @@ struct ConfigOptions {
 	bool                   renderdoc_enabled           = false;
 	bool                   readback_linear_images      = false;
 	bool                   playgo_hack_enabled         = false;
+	bool                   hot_page_tracking           = true;
 	bool                   async_shaders               = true;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = false;
@@ -110,6 +111,7 @@ bool GpuAssistedValidationEnabled();
 bool RenderDocEnabled();
 bool ReadbackLinearImagesEnabled();
 bool PlayGoHackEnabled();
+bool HotPageTrackingEnabled();
 bool AsyncShadersEnabled();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled();
