@@ -343,7 +343,7 @@ set(inc_headers
 	${KYTY_THIRD_PARTY_DIR}/VulkanMemoryAllocator/include
 	${KYTY_THIRD_PARTY_DIR}/SPIRV-Tools/include
 	${KYTY_THIRD_PARTY_DIR}/fmt/include
-	${KYTY_THIRD_PARTY_DIR}/xxhash
+	${KYTY_THIRD_PARTY_DIR}/xxHash
 	${KYTY_THIRD_PARTY_DIR}/cpuinfo/include
 	${KYTY_THIRD_PARTY_DIR}/renderdoc
 	${KYTY_THIRD_PARTY_DIR}/stb
@@ -421,7 +421,7 @@ add_executable(memory_tracker_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/pageManager.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/memoryTracker.cpp"
 )
-target_link_libraries(memory_tracker_tests fmt::fmt common)
+target_link_libraries(memory_tracker_tests fmt::fmt common xxhash)
 target_include_directories(memory_tracker_tests PRIVATE ${inc_headers})
 
 add_executable(shader_vertex_metadata_tests EXCLUDE_FROM_ALL
