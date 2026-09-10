@@ -3001,7 +3001,8 @@ void TestConcurrentFixedRemapWaitsForTransition() {
 }
 
 int main(int argc, char** argv) {
-	InitSubsystems();
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    InitSubsystems();
 	if (argc == 2 && std::strcmp(argv[1], "--red-zone-patcher-only") == 0) {
 		RunTest(TestWindowsGuestRedZoneStaticPatcher);
 		return g_failed_tests == 0 ? 0 : 1;
