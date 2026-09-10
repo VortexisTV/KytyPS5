@@ -2562,7 +2562,7 @@ void TestRageStyleFixedBatchMapChurn() {
 	const char* test = "RageStyleFixedBatchMapChurn";
 
 	constexpr uint64_t PageSize     = 0x10000; // RAGE commits 64 KiB blocks
-	constexpr uint64_t VaBase       = 0x1600000000ull;
+	constexpr uint64_t VaBase       = 0x7600000000ull;
 	constexpr uint64_t VaPages      = 192;
 	constexpr uint64_t DmemPages    = VaPages * 2;
 	constexpr int      Prot         = 0xf3; // CPU RW | GPU RW | AMPR RW, as GTA V passes it
@@ -2841,7 +2841,7 @@ void TestRageStyleFixedBatchMapChurn() {
 void TestFixedRemapOfIdenticalDirectMappingKeepsPage() {
 	const char*        test    = "FixedRemapOfIdenticalDirectMappingKeepsPage";
 	constexpr uint64_t size    = 0x10000;
-	constexpr uint64_t vaddr   = 0x1610000000ull;
+	constexpr uint64_t vaddr   = 0x7610000000ull;
 	constexpr int      prot_rw = SceKernelProtCpuRead | SceKernelProtCpuRw | 0x30;
 	constexpr int      prot_ro = SceKernelProtCpuRead | 0x10;
 	constexpr uint64_t marker  = 0x4b59545952414745ull;
@@ -2944,7 +2944,7 @@ struct WriterJoiner {
 void TestConcurrentFixedRemapWaitsForTransition() {
 	const char*        test  = "ConcurrentFixedRemapWaitsForTransition";
 	constexpr uint64_t size  = 0x10000;
-	constexpr uint64_t vaddr = 0x1620000000ull;
+	constexpr uint64_t vaddr = 0x7620000000ull;
 	constexpr int      prot  = SceKernelProtCpuRead | SceKernelProtCpuRw;
 
 	int64_t dmem = -1;
