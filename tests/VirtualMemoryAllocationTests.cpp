@@ -2917,12 +2917,26 @@ namespace {
 std::atomic<uint32_t> g_transition_waits {0};
 
 bool TransitionFaultHandler(const Common::HostException::ExceptionInfo& info) {
-	if (info.type == Common::HostException::ExceptionType::AccessViolation &&
-	    Libs::LibKernel::Memory::WaitForMappingTransition(info.access_violation_vaddr)) {
-		g_transition_waits.fetch_add(1, std::memory_order_relaxed);
-		return true;
-	}
-	return false;
+    constexpr uint64_t test_vaddr = 0x7620000000ull;
+    constexpr uint64_t test_size  = 0x10000;
+
+    if (info.type != Common::HostException::ExceptionType::AccessViolation) {
+        return false;
+    }
+
+    const uint64_t fault = info.access_violation_vaddr;
+    if (fault < test_vaddr || fault - test_vaddr >= test_size) {
+        return false;
+    }
+
+    // If the transition is still active, wait for it.
+    // If it already completed before this signal handler ran, the mapping
+    // is valid again and the faulting instruction should simply be retried.
+    if (Libs::LibKernel::Memory::WaitForMappingTransition(fault)) {
+        g_transition_waits.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    return true;
 }
 
 struct WriterJoiner {
