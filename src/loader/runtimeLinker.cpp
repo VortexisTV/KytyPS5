@@ -882,9 +882,34 @@ static void GetDynValue(Elf64* elf, T* out, Elf64_Sxword tag) {
 
 template <class T>
 static void GetDynValues(Elf64* elf, T* out, Elf64_Sxword tag) {
-	for (const auto* dyn: elf->GetDynList(tag)) {
-		out->push_back(dyn->d_un.d_val);
-	}
+    if (elf == nullptr) {
+        LOGF("GetDynValues: elf == nullptr, tag=0x%016" PRIx64 "\n",
+             static_cast<uint64_t>(tag));
+        return;
+    }
+
+    if (out == nullptr) {
+        LOGF("GetDynValues: out == nullptr, tag=0x%016" PRIx64 "\n",
+             static_cast<uint64_t>(tag));
+        return;
+    }
+
+    const auto dyn_list = elf->GetDynList(tag);
+
+    LOGF("GetDynValues: elf=%p dynamic=%p tag=0x%016" PRIx64 " count=%zu\n",
+         static_cast<void*>(elf),
+         static_cast<const void*>(elf->GetDynamic()),
+         static_cast<uint64_t>(tag),
+         dyn_list.size());
+
+    for (const auto* dyn: dyn_list) {
+        if (dyn == nullptr) {
+            LOGF("GetDynValues: nullptr entry\n");
+            continue;
+        }
+
+        out->push_back(dyn->d_un.d_val);
+    }
 }
 
 template <class T>
