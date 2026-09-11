@@ -612,10 +612,40 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
     : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
+
+	m_async = Config::AsyncShadersEnabled();
+}
+
+void PipelineCache::DrainCompletedPipelines() {
+	std::vector<CompletedPipeline> completed;
+
+	{
+		std::lock_guard lock(m_completed_pipeline_mutex);
+		completed.swap(m_completed_pipelines);
+	}
+
+	for (auto& done: completed) {
+		m_pending_pipelines.erase(done.key);
+
+		auto [iter, inserted] =
+		    m_graphics_pipelines.emplace(std::move(done.key), std::move(done.pipeline));
+
+		EXIT_IF(!inserted);
+	}
 }
 
 PipelineCache::~PipelineCache() {
+	if (m_async) {
+		// Destroying ProgramCache waits for its worker queue to finish.
+		// This also guarantees async graphics-pipeline jobs are done before
+		// the Vulkan pipeline cache and graphics pipelines are destroyed.
+		m_program_cache.reset();
+
+		DrainCompletedPipelines();
+	}
+
 	Save();
+
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& [key, pipeline]: pipelines) {
 			(void)key;
@@ -855,7 +885,7 @@ bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other)
 	return std::memcmp(this, &other, sizeof(*this)) == 0;
 }
 
-PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipeline(
+PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipeline(
     std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
     const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
@@ -994,34 +1024,111 @@ PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipeline(
 		EXIT_IF(attributes_num != static_cast<uint32_t>(vs_input_info.resources_num));
 	}
 
+	if (m_async) {
+		DrainCompletedPipelines();
+	}
+
 	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
-		return *iter->second;
+		return iter->second.get();
+	}
+
+	if (m_async) {
+		if (m_pending_pipelines.contains(key)) {
+			return nullptr;
+		}
+
+		m_pending_pipelines.insert(key);
+
+		auto vs_copy = std::make_shared<ShaderVertexInputInfo>(vs_input_info);
+
+		std::shared_ptr<ShaderPixelInputInfo> ps_copy;
+		if (ps_active) {
+			ps_copy = std::make_shared<ShaderPixelInputInfo>(*ps_input_info);
+		}
+
+		const ShaderProgram vertex_copy = vertex_program;
+		const ShaderProgram pixel_copy  = pixel_program;
+
+		m_program_cache->Enqueue(
+	    	[this, key, vs_copy, ps_copy, vertex_copy, pixel_copy]() mutable {
+		    	auto cached = std::make_unique<Pipeline>();
+
+		    	LogPipelineTrace(
+		        	"CreatePipelineInternal async begin",
+		        	vertex_copy.id,
+		        	pixel_copy.id);
+
+		    	CreatePipelineInternal(
+		        	m_graphics,
+		        	*cached,
+		        	key.rendering,
+		        	key.vertex_input,
+		        	*vs_copy,
+		        	vertex_copy,
+		        	ps_copy ? ps_copy.get() : nullptr,
+		        	pixel_copy,
+		        	key.static_params,
+		        	m_driver_cache);
+
+		    	LogPipelineTrace(
+		        	"CreatePipelineInternal async done",
+		        	vertex_copy.id,
+		        	pixel_copy.id);
+
+		    	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
+		    	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
+
+		    	std::lock_guard lock(m_completed_pipeline_mutex);
+
+		    	m_completed_pipelines.push_back(
+		        	{std::move(key), std::move(cached)});
+	    	});
+
+		return nullptr;
 	}
 
 	if (graphics_debug_dump_enabled()) {
 		ShaderDbgDumpInputInfo(vs_input_info);
+
 		if (ps_active) {
 			ShaderDbgDumpInputInfo(*ps_input_info);
 		}
-		LOGF("PipelineTrace: shader modules VS=%" PRIu64 " module=%p PS=%" PRIu64 " module=%p\n",
-		     vs_id, static_cast<void*>(vertex_program.module), ps_id,
-		     static_cast<void*>(pixel_program.module));
+
+		LOGF("PipelineTrace: shader modules VS=%" PRIu64
+	     	" module=%p PS=%" PRIu64 " module=%p\n",
+	     	vs_id,
+	     	static_cast<void*>(vertex_program.module),
+	     	ps_id,
+	     	static_cast<void*>(pixel_program.module));
 	}
 
 	auto cached = std::make_unique<Pipeline>();
+
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
-	CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vs_input_info,
-	                       vertex_program, ps_input_info, pixel_program, static_params,
-	                       m_driver_cache);
+
+	CreatePipelineInternal(
+    	m_graphics,
+    	*cached,
+    	rendering,
+    	key.vertex_input,
+    	vs_input_info,
+    	vertex_program,
+    	ps_input_info,
+    	pixel_program,
+    	static_params,
+    	m_driver_cache);
+
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
 
-	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
+	auto [iter, inserted] =
+    	m_graphics_pipelines.emplace(std::move(key), std::move(cached));
+
 	EXIT_IF(!inserted);
 
-	return *iter->second;
+	return iter->second.get();
 }
 
 PipelineCache::Pipeline&
