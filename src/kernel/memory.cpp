@@ -11,6 +11,9 @@
 #include "libs/errno.h"
 #include "libs/libs.h"
 
+#include <chrono>
+#include <condition_variable>
+#include <optional>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -164,6 +167,59 @@ static bool VirtualRangesOverlap(uint64_t left_start, uint64_t left_size, uint64
 
 	return left_start < right_end && right_start < left_end;
 }
+
+struct MappingTransition {
+	uint64_t start = 0;
+	uint64_t size  = 0;
+	int      owner = 0;
+};
+
+static std::mutex                     g_transition_mutex;
+static std::condition_variable        g_transition_cv;
+static std::vector<MappingTransition> g_transitions;
+
+class MappingTransitionScope {
+public:
+	MappingTransitionScope(uint64_t start, uint64_t size) {
+		if (start == 0 || size == 0) {
+			return;
+		}
+
+		m_transition = {start, size, Common::Thread::GetThreadIdUnique()};
+
+		std::lock_guard lock(g_transition_mutex);
+		g_transitions.push_back(m_transition);
+	}
+
+	~MappingTransitionScope() {
+		if (m_transition.size == 0) {
+			return;
+		}
+
+		{
+			std::lock_guard lock(g_transition_mutex);
+
+			const auto it = std::find_if(
+			    g_transitions.rbegin(), g_transitions.rend(),
+			    [this](const auto& transition) {
+				    return transition.start == m_transition.start &&
+				           transition.size == m_transition.size &&
+				           transition.owner == m_transition.owner;
+			    });
+
+			if (it != g_transitions.rend()) {
+				g_transitions.erase(std::next(it).base());
+			}
+		}
+
+		g_transition_cv.notify_all();
+	}
+
+	KYTY_CLASS_NO_COPY(MappingTransitionScope);
+
+private:
+	MappingTransition m_transition;
+};
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 static uint32_t g_test_backing_store_unmaps_before_failure = UINT32_MAX;
@@ -2909,6 +2965,18 @@ int KYTY_SYSV_ABI KernelCheckedReleaseDirectMemory(int64_t start, size_t len) {
 	return result == KERNEL_ERROR_EACCES ? KERNEL_ERROR_ENOENT : result;
 }
 
+static bool IsIdenticalDirectSpan(const std::vector<VirtualRanges::Range>& pieces,
+                                  uint64_t vaddr,
+                                  uint64_t direct_memory_start) {
+	return !pieces.empty() &&
+	       std::all_of(pieces.begin(), pieces.end(),
+	                   [vaddr, direct_memory_start](const auto& piece) {
+		                   return piece.type == VirtualRangeType::Direct &&
+		                          piece.offset ==
+		                              direct_memory_start + (piece.start - vaddr);
+	                   });
+}
+
 int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int flags,
                                         int64_t direct_memory_start, size_t alignment) {
 	PRINT_NAME();
@@ -2964,6 +3032,8 @@ int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int f
 		}
 	};
 
+	std::optional<MappingTransitionScope> transition;
+
 	if (fixed) {
 		if (in_addr == 0 || (in_addr & (PAGE_SIZE - 1u)) != 0 ||
 		    (alignment != 0 && in_addr % alignment != 0)) {
@@ -2972,6 +3042,37 @@ int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int f
 		if (no_overwrite && g_virtual_ranges->HasOverlap(in_addr, len)) {
 			return KERNEL_ERROR_ENOMEM;
 		}
+
+		if (std::vector<VirtualRanges::Range> live;
+    g_virtual_ranges->QuerySpan(in_addr, len, &live) &&
+    IsIdenticalDirectSpan(live, in_addr,
+                          static_cast<uint64_t>(direct_memory_start))) {
+
+	if (std::any_of(live.begin(), live.end(),
+	                [prot](const auto& piece) {
+		                return piece.protection != prot;
+	                })) {
+
+		const int protect_result =
+		    KernelMprotect(reinterpret_cast<const void*>(in_addr),
+		                   len, prot);
+
+		if (protect_result != OK) {
+			return protect_result;
+		}
+	}
+
+	*addr = reinterpret_cast<void*>(in_addr);
+
+	LOGF("\t identical direct mapping kept: addr=0x%016" PRIx64
+	     " dmem=0x%016" PRIx64
+	     " size=0x%016" PRIx64 "\n",
+	     in_addr,
+	     static_cast<uint64_t>(direct_memory_start),
+	     static_cast<uint64_t>(len));
+
+	return OK;
+}
 
 		std::vector<VirtualRanges::Range> reserved_ranges;
 		if (g_virtual_ranges->QuerySpan(in_addr, len, &reserved_ranges) &&
@@ -2996,6 +3097,7 @@ int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int f
 	} else {
 		constexpr size_t DEFAULT_ALIGNMENT = 0x4000;
 		alignment                          = (alignment != 0 ? alignment : DEFAULT_ALIGNMENT);
+		transition.emplace(in_addr, len);
 		std::vector<VirtualRanges::Range> reserved_ranges;
 		if (in_addr != 0 && g_virtual_ranges->QuerySpan(in_addr, len, &reserved_ranges) &&
 		    std::all_of(reserved_ranges.begin(), reserved_ranges.end(), [](const auto& range) {
