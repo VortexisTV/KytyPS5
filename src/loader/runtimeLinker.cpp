@@ -788,11 +788,6 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 	}
 
 	if (info->type == Common::HostException::ExceptionType::AccessViolation) {
-		// A page is briefly inaccessible while a memory operation on another thread rebuilds its
-		// host mapping; once that operation has finished the access simply succeeds.
-		if (Libs::LibKernel::Memory::WaitForMappingTransition(info->access_violation_vaddr)) {
-			return true;
-		}
 		using CoreAccess = Common::HostException::AccessViolationType;
 		using GpuAccess  = Libs::Graphics::PageFaultAccess;
 		GpuAccess access;
@@ -841,9 +836,6 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			std::printf("\n");
 		}
 		std::fflush(stdout);
-		if (info->type == Common::HostException::ExceptionType::AccessViolation) {
-			Libs::LibKernel::Memory::DumpGuestMemoryState(info->access_violation_vaddr);
-		}
 	}
 	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64
 	     " access=%u address=0x%016" PRIx64 "\n",

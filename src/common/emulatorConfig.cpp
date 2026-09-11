@@ -127,10 +127,6 @@ bool PlayGoHackEnabled() {
 	return g_config->playgo_hack_enabled;
 }
 
-bool HotPageTrackingEnabled() {
-	return g_config->hot_page_tracking;
-}
-
 bool AsyncShadersEnabled() {
 	return g_config->async_shaders;
 }

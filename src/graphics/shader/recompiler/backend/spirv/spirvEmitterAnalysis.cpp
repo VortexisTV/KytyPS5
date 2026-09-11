@@ -6,13 +6,6 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
-uint32_t PixelParameterMappedLocation(const EmitterState& state, uint32_t attr) {
-	if (state.stage != ShaderType::Pixel) {
-		return attr;
-	}
-	return ShaderPixelParameterMappedLocation(*state.input_info.pixel, attr);
-}
-
 uint32_t PixelParameterLocation(const EmitterState& state, uint32_t attr) {
 	std::array<uint32_t, 32> active_inputs {};
 	uint32_t                 active_count = 0;
@@ -158,7 +151,8 @@ uint32_t ImageType(EmitterState& state, const IR::ImageResource& image) {
 	}
 	const auto& info = ImageDimensionInfoFor(image.dimension);
 	return state.builder.Type(OpTypeImage,
-	                          {ImageScalarType(state, image.numeric_class), info.spirv_dimension, 0,
+	                          {ImageScalarType(state, image.numeric_class), info.spirv_dimension,
+	                           image.depth_compare ? 1u : 0u,
 	                           info.arrayed, info.multisampled, sampled, format});
 }
 
@@ -278,6 +272,7 @@ void EmitStorageImageWrite(EmitterState& state, uint32_t resource, uint32_t mip_
 uint32_t ExecutionModelForStage(ShaderType stage) {
 	switch (stage) {
 		case ShaderType::Vertex: return ExecutionModelVertex;
+		case ShaderType::Mesh: return 5365u; // MeshEXT
 		case ShaderType::Pixel: return ExecutionModelFragment;
 		default: return ExecutionModelGLCompute;
 	}

@@ -35,11 +35,13 @@ struct ImageUsage {
 };
 
 struct ImageBinding {
-	bool is_bound      = false;
-	bool is_target     = false;
-	bool needs_rebind  = false;
-	bool force_general = false;
-	bool shader_write  = false;
+	vk::ImageLayout  attachment_layout = vk::ImageLayout::eUndefined;
+	vk::AccessFlags2 attachment_access;
+	bool             is_bound      = false;
+	bool             is_target     = false;
+	bool             needs_rebind  = false;
+	bool             force_general = false;
+	bool             shader_write  = false;
 };
 
 class Image final {
@@ -49,7 +51,6 @@ public:
 	KYTY_CLASS_NO_COPY(Image);
 
 	[[nodiscard]] vk::ImageView FindView(const ImageViewInfo& view_info);
-	void                        AssociateDepth(ImageId image_id) { depth_id = image_id; }
 	using Barriers = std::vector<vk::ImageMemoryBarrier2>;
 	[[nodiscard]] Barriers GetBarriers(vk::ImageLayout                      destination_layout,
 	                                   vk::AccessFlags2                     destination_access,
@@ -127,9 +128,6 @@ public:
 		return pages ? ImagePageRangesOverlap(info.data.address, info.data.size, address, size)
 		             : ImageRangeOverlaps(info.data.address, info.data.size, address, size);
 	}
-	[[nodiscard]] bool GpuOverlaps(uint64_t address, uint64_t size) const noexcept {
-		return IsGpuModified() && Overlaps(address, size);
-	}
 	[[nodiscard]] bool SafeToDownload() const noexcept {
 		return IsGpuModified() && !IsBufferModified() && !IsCpuDirty();
 	}
@@ -161,8 +159,8 @@ private:
 	[[nodiscard]] static std::pair<uint32_t, uint32_t>
 	SanitizeCopyLayers(const Image& source, const Image& destination, uint32_t depth);
 
-	GraphicContext*   m_graphics         = nullptr;
-	CommandScheduler* m_scheduler        = nullptr;
+	GraphicContext&   m_graphics;
+	CommandScheduler& m_scheduler;
 	uint64_t          m_maybe_cpu_hash   = 0;
 	bool              m_cpu_dirty        = false;
 	bool              m_maybe_cpu_dirty  = false;

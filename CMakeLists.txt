@@ -126,7 +126,7 @@ if (KYTY_LINKER STREQUAL LD AND NOT LINUX)
 	set(KYTY_LD_OPTIONS "-Wl,--image-base=0x100000000000")
 endif()
 
-project(Kyty${KYTY_PROJECT_NAME}${CMAKE_BUILD_TYPE}${KYTY_COMPILER} VERSION 0.2.2)
+project(Kyty${KYTY_PROJECT_NAME}${CMAKE_BUILD_TYPE}${KYTY_COMPILER} VERSION 0.3.0)
 
 include_directories(
 	${KYTY_THIRD_PARTY_DIR}/gtest/include
@@ -343,7 +343,7 @@ set(inc_headers
 	${KYTY_THIRD_PARTY_DIR}/VulkanMemoryAllocator/include
 	${KYTY_THIRD_PARTY_DIR}/SPIRV-Tools/include
 	${KYTY_THIRD_PARTY_DIR}/fmt/include
-	${KYTY_THIRD_PARTY_DIR}/xxHash
+	${KYTY_THIRD_PARTY_DIR}/xxhash
 	${KYTY_THIRD_PARTY_DIR}/cpuinfo/include
 	${KYTY_THIRD_PARTY_DIR}/renderdoc
 	${KYTY_THIRD_PARTY_DIR}/stb
@@ -421,7 +421,7 @@ add_executable(memory_tracker_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/pageManager.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/memoryTracker.cpp"
 )
-target_link_libraries(memory_tracker_tests fmt::fmt common xxhash)
+target_link_libraries(memory_tracker_tests fmt::fmt common)
 target_include_directories(memory_tracker_tests PRIVATE ${inc_headers})
 
 add_executable(shader_vertex_metadata_tests EXCLUDE_FROM_ALL
@@ -567,6 +567,8 @@ if(BUILD_TESTING)
 
 	add_test(NAME texture_cache_layered_image
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --layered-image-only)
+	add_test(NAME host_image_allocation
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --host-image-allocation-only)
 	add_test(NAME texture_cache_image_views
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-view-cache-only)
 	add_test(NAME texture_cache_storage_sampled
@@ -577,8 +579,6 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --compute-meta-clear-only)
 	add_test(NAME buffer_cache_dirty_gc
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-gc-only)
-	add_test(NAME vertex_buffer_mapped_extent
-		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --vertex-buffer-extent-only)
 
 	if(WIN32)
 		# These tests still depend on the Windows multisample-depth path.

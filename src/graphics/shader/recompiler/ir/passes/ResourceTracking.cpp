@@ -230,8 +230,7 @@ private:
 				}
 				const auto flags = inst->Flags<MemoryFlags>();
 				if (flags.index >= m_program.memory_info.size()) {
-					Fail(flags.pc,
-					     fmt::format("memory metadata index {} is out of range", flags.index));
+					Fail(flags.pc, fmt::format("memory metadata index {} is out of range", flags.index));
 				}
 				auto& memory = m_program.memory_info[flags.index];
 				if (memory.kind != ResourceKind::ScalarBuffer || inst->NumArgs() != 2u) {
@@ -258,8 +257,6 @@ private:
 					continue;
 				}
 
-				// Scalar reads need only the selected descriptor's address. Preserve its dynamic
-				// low/high words and route the load through the existing guest-address BDA path.
 				const auto high = Value(&*block->PrependNewInst(
 				    inst, ValueOpcode::BitwiseAnd32, {handle->Arg(1), Value(0xffffu)}));
 				const auto address = Value(&*block->PrependNewInst(
@@ -548,8 +545,6 @@ private:
 			bad_dword = 0;
 		}
 		if (!ValidateSource(descriptor, bad_dword)) {
-			// Dynamic sampler tables are not materialized yet. Keep tracking the paired image and use
-			// the native default point sampler for the narrowly identified Phi-selected case.
 			std::vector<const Inst*> visited;
 			const bool dynamic_sampler_base =
 			    sampler && bad_dword == 0u &&

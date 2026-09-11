@@ -11,8 +11,6 @@ class Presenter;
 [[nodiscard]] Presenter& WindowInit(uint32_t width, uint32_t height);
 void                     WindowRun();
 void                     WindowShutdown();
-// Best-effort pipeline-cache save while the process terminates on a fault.
-void WindowEmergencySavePipelineCache() noexcept;
 
 } // namespace Libs::Graphics
 

@@ -1,5 +1,6 @@
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
+#include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
 
 #include <algorithm>
 #include <bit>
@@ -31,61 +32,18 @@ uint32_t ImageGatherComponent(uint32_t dmask) {
 	}
 }
 
-uint32_t Unary(EmitterState& state, uint32_t opcode, uint32_t type, uint32_t value) {
-	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction({opcode, type, result, value});
-	return result;
-}
-
-uint32_t Binary(EmitterState& state, uint32_t opcode, uint32_t type, uint32_t lhs, uint32_t rhs) {
-	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction({opcode, type, result, lhs, rhs});
-	return result;
-}
-
 bool HasFlag(const IR::MemoryInfo& mem, uint32_t flag) {
 	return (mem.image_sample_flags & flag) != 0u;
 }
 
-bool UsesA16(const IR::MemoryInfo& mem) {
-	return HasFlag(mem, Decoder::ImageSampleFlagA16);
-}
-
-bool ComponentUsesA16(const IR::MemoryInfo& mem, uint32_t component) {
-	if (!UsesA16(mem)) return false;
-	uint32_t cursor = 0;
-	if (HasFlag(mem, Decoder::ImageSampleFlagOffset)) {
-		if (component == cursor) return false;
-		cursor++;
-	}
-	if (HasFlag(mem, Decoder::ImageSampleFlagBias)) {
-		if (component == cursor) return true;
-		cursor++;
-	}
-	if (HasFlag(mem, Decoder::ImageSampleFlagCompare) && component == cursor) return false;
-	return true;
-}
-
-uint32_t HalfComponent(const IR::MemoryInfo& mem, uint32_t component) {
-	if (!UsesA16(mem)) return component * 2u;
-	uint32_t half = 0;
-	for (uint32_t index = 0; index < component; index++) {
-		const auto width = ComponentUsesA16(mem, index) ? 1u : 2u;
-		if (width == 2u && (half & 1u) != 0u) half++;
-		half += width;
-	}
-	if (!ComponentUsesA16(mem, component) && (half & 1u) != 0u) half++;
-	return half;
-}
-
 uint32_t AddressU32(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::Inst& address,
                     uint32_t component) {
-	const auto half   = HalfComponent(mem, component);
-	const auto packed = half / 2u;
+	const auto layout = Decoder::ImageAddressComponentLayout(mem.image_sample_flags, component);
+	const auto packed = layout.bit_offset / 32u;
 	if (packed >= address.NumArgs()) return ConstantU32(ctx.state, 0);
 	auto value = ctx.Def(address.Arg(packed));
-	if (ComponentUsesA16(mem, component)) {
-		if ((half & 1u) != 0u) {
+	if (layout.bit_width == 16u) {
+		if ((layout.bit_offset & 31u) != 0u) {
 			value = Binary(ctx.state, OpShiftRightLogical, TypeU32(ctx.state), value,
 			               ConstantU32(ctx.state, 16));
 		}
@@ -98,7 +56,7 @@ uint32_t AddressU32(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::
 uint32_t AddressF32(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::Inst& address,
                     uint32_t component) {
 	const auto value = AddressU32(ctx, mem, address, component);
-	return ComponentUsesA16(mem, component)
+	return Decoder::ImageAddressComponentLayout(mem.image_sample_flags, component).bit_width == 16u
 	           ? EmitF16BitsToF32(ctx.state, value)
 	           : Unary(ctx.state, OpBitcast, TypeF32(ctx.state), value);
 }
@@ -798,8 +756,8 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			return true;
 		}
 		const auto* handle = image_arg.ResolveInstruction();
-		const auto* source = image.source < ctx.program.descriptor_sources.size()
-		                         ? &ctx.program.descriptor_sources[image.source]
+		const auto* source = image.source < state.program.descriptor_sources.size()
+		                         ? &state.program.descriptor_sources[image.source]
 		                         : nullptr;
 		if (handle == nullptr || source == nullptr || !source->indirect_image.has_value() ||
 		    source->indirect_image->key_arg >= handle->NumArgs()) {

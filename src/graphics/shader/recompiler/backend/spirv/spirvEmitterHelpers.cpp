@@ -2,10 +2,6 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
-uint32_t EmitTrueBool(EmitterState& state) {
-	return ConstantBool(state, true);
-}
-
 DppTargetLane EmitDppQuadPermTargetLane(EmitterState& state, uint32_t subid, uint32_t control) {
 	const auto quad_base = state.builder.AllocateId();
 	const auto lane      = state.builder.AllocateId();
@@ -23,7 +19,7 @@ DppTargetLane EmitDppQuadPermTargetLane(EmitterState& state, uint32_t subid, uin
 	state.builder.AddFunction(
 	    {OpBitwiseAnd, TypeU32(state), selected, selected0, ConstantU32(state, 3)});
 	state.builder.AddFunction({OpBitwiseOr, TypeU32(state), target, quad_base, selected});
-	return {target, EmitTrueBool(state)};
+	return {target, ConstantBool(state, true)};
 }
 
 DppTargetLane EmitDppRowShiftTargetLane(EmitterState& state, uint32_t subid, uint32_t amount,
@@ -70,7 +66,7 @@ DppTargetLane EmitDppRowRotateRightTargetLane(EmitterState& state, uint32_t subi
 	    {OpIAdd, TypeU32(state), plus, lane, ConstantU32(state, 16u - amount)});
 	state.builder.AddFunction({OpSelect, TypeU32(state), selected, in_high, minus, plus});
 	state.builder.AddFunction({OpBitwiseOr, TypeU32(state), target, row, selected});
-	return {target, EmitTrueBool(state)};
+	return {target, ConstantBool(state, true)};
 }
 
 DppTargetLane EmitDppMirrorTargetLane(EmitterState& state, uint32_t subid, bool half_row) {
@@ -87,7 +83,7 @@ DppTargetLane EmitDppMirrorTargetLane(EmitterState& state, uint32_t subid, bool 
 	state.builder.AddFunction(
 	    {OpISub, TypeU32(state), mirrored, ConstantU32(state, lane_mask), lane});
 	state.builder.AddFunction({OpBitwiseOr, TypeU32(state), target, base, mirrored});
-	return {target, EmitTrueBool(state)};
+	return {target, ConstantBool(state, true)};
 }
 
 DppTargetLane EmitDppTargetLane(EmitterState& state, uint32_t control) {
@@ -114,9 +110,9 @@ DppTargetLane EmitDppTargetLane(EmitterState& state, uint32_t control) {
 		const auto target = state.builder.AllocateId();
 		state.builder.AddFunction(
 		    {OpBitwiseXor, TypeU32(state), target, subid, ConstantU32(state, control & 0xfu)});
-		return {target, EmitTrueBool(state)};
+		return {target, ConstantBool(state, true)};
 	}
-	return {subid, EmitTrueBool(state)};
+	return {subid, ConstantBool(state, true)};
 }
 
 uint32_t EmitSubgroupLocalInvocationId(EmitterState& state) {
@@ -126,7 +122,7 @@ uint32_t EmitSubgroupLocalInvocationId(EmitterState& state) {
 	const auto value = state.builder.AllocateId();
 	state.builder.AddFunction(
 	    {OpLoad, TypeU32(state), value, state.subgroup_local_invocation_id_variable});
-	return value;
+	return state.lane_half == 0 ? value : EmitAddU32(state, value, ConstantU32(state, 32));
 }
 
 uint32_t InputVariableForKind(const EmitterState& state, IR::StageInputKind kind) {
@@ -167,31 +163,24 @@ uint32_t EmitLocalInvocationIndex(EmitterState& state) {
 	}
 	const auto value = state.builder.AllocateId();
 	state.builder.AddFunction({OpLoad, TypeU32(state), value, variable});
-	return value;
-}
-
-uint32_t VertexInputDefaultComponentU32(EmitterState& state, VertexInputScalarKind kind,
-                                        uint32_t component) {
-	if ((component & 3u) != 3u) {
-		return ConstantU32(state, 0);
+	if (state.lane_count == 2) {
+		const auto wave_base = EmitBinaryU32(state, OpBitwiseAnd, value, ConstantU32(state, ~31u));
+		return EmitAddU32(state, EmitAddU32(state, value, wave_base),
+		                  ConstantU32(state, state.lane_half * 32));
 	}
-	return ConstantU32(state, kind == VertexInputScalarKind::Float ? 0x3f800000u : 1u);
+	return value;
 }
 
 uint32_t EmitVertexParameterComponentU32(EmitterState& state, const InputBinding& input,
                                          uint32_t component) {
-	const auto count = VertexParameterComponentCount(state, input);
+	const auto count = VertexParameterComponentCount(input);
 	const auto kind  = VertexParameterScalarKind(state, input.location);
-	if (component >= count) {
-		return VertexInputDefaultComponentU32(state, kind, component);
-	}
-
 	const auto scalar_type = VertexParameterScalarType(state, kind);
 	uint32_t   raw         = state.builder.AllocateId();
 	if (count == 1u) {
 		state.builder.AddFunction({OpLoad, scalar_type, raw, input.variable_id});
 	} else {
-		const auto pointer_type = VertexParameterScalarPointerType(state, kind);
+		const auto pointer_type = TypePointer(state, StorageClassInput, scalar_type);
 		const auto pointer      = state.builder.AllocateId();
 		state.builder.AddFunction({OpAccessChain, pointer_type, pointer, input.variable_id,
 		                           ConstantU32(state, component)});
@@ -210,14 +199,14 @@ uint32_t EmitVertexParameterComponentU32(EmitterState& state, const InputBinding
 uint32_t EmitSubgroupLaneActiveBool(EmitterState& state, uint32_t lane) {
 	const auto active_ballot = state.builder.AllocateId();
 	state.builder.AddFunction({OpGroupNonUniformBallot, TypeU32Vector(state, 4), active_ballot,
-	                           ConstantU32(state, ScopeSubgroup), EmitTrueBool(state)});
+	                           ConstantU32(state, ScopeSubgroup), ConstantBool(state, true)});
 	return EmitBallotLaneActiveBool(state, active_ballot, lane);
 }
 uint32_t EmitBallotLaneActiveBool(EmitterState& state, uint32_t active_ballot, uint32_t lane) {
 	const auto low = state.builder.AllocateId();
 	state.builder.AddFunction({OpCompositeExtract, TypeU32(state), low, active_ballot, 0});
 	uint32_t mask = low;
-	if (state.wave_size == 64u) {
+	if (state.program.wave_size == 64u) {
 		const auto high     = state.builder.AllocateId();
 		const auto in_high  = state.builder.AllocateId();
 		const auto selected = state.builder.AllocateId();
@@ -242,7 +231,7 @@ uint32_t EmitBallotLaneActiveBool(EmitterState& state, uint32_t active_ballot, u
 	state.builder.AddFunction({OpBitwiseAnd, TypeU32(state), hit, mask, bit});
 	state.builder.AddFunction({OpINotEqual, TypeBool(state), active, hit, ConstantU32(state, 0)});
 	state.builder.AddFunction(
-	    {OpULessThan, TypeBool(state), in_range, lane, ConstantU32(state, state.wave_size)});
+	    {OpULessThan, TypeBool(state), in_range, lane, ConstantU32(state, state.program.wave_size)});
 	state.builder.AddFunction({OpLogicalAnd, TypeBool(state), ret, active, in_range});
 	return ret;
 }

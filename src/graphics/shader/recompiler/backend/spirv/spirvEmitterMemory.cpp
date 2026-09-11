@@ -7,31 +7,15 @@
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
 
-uint32_t Unary(EmitterState& state, uint32_t opcode, uint32_t type, uint32_t value) {
-	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction({opcode, type, result, value});
-	return result;
-}
-
-uint32_t Binary(EmitterState& state, uint32_t opcode, uint32_t type, uint32_t lhs, uint32_t rhs) {
-	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction({opcode, type, result, lhs, rhs});
-	return result;
-}
-
-uint32_t Select(EmitterState& state, uint32_t type, uint32_t condition, uint32_t true_value,
-                uint32_t false_value) {
-	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction({OpSelect, type, result, condition, true_value, false_value});
-	return result;
-}
-
 uint32_t AndCondition(EmitterState& state, uint32_t lhs, uint32_t rhs) {
 	return Binary(state, OpLogicalAnd, TypeBool(state), lhs, rhs);
 }
 
 uint32_t EmitDsMaskedLaneRead(EmitterState& state, uint32_t source, uint32_t target,
                               uint32_t exec) {
+	if (state.lane_count == 2) {
+		target = Binary(state, OpBitwiseAnd, TypeU32(state), target, ConstantU32(state, 31));
+	}
 	const auto shuffled = state.builder.AllocateId();
 	state.builder.AddFunction({OpGroupNonUniformShuffle, TypeU32(state), shuffled,
 	                           ConstantU32(state, ScopeSubgroup), source, target});
@@ -287,12 +271,6 @@ PreparedMemoryElement PrepareMemoryElement(ValueEmitContext& ctx, const IR::Memo
 	return {.resource = resource, .index = index};
 }
 
-PreparedMemoryElement PrepareMemoryElement(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
-                                           const MemoryResourceAccess& resource,
-                                           uint32_t                    raw_index) {
-	return {.resource = resource, .index = EmitMemoryElementIndex(ctx.state, resource, raw_index)};
-}
-
 uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
                           uint32_t index);
 
@@ -301,10 +279,10 @@ uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& 
 
 uint32_t LoadWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                           const MemoryResourceAccess& resource) {
-	const auto access = PrepareMemoryElement(ctx, mem, resource, DwordIndex(ctx, inst, mem));
+	const auto index = EmitMemoryElementIndex(ctx.state, resource, DwordIndex(ctx, inst, mem));
 	return EmitValueOrZeroIfCondition(
-	    ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index),
-	    [&]() { return LoadWordInBounds(ctx, access.resource, access.index); });
+	    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index),
+	    [&]() { return LoadWordInBounds(ctx, resource, index); });
 }
 
 uint32_t LoadWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) {
@@ -320,11 +298,10 @@ uint32_t LoadSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const 
 	const auto address   = ByteAddress(ctx, inst, mem);
 	const auto raw_index = Binary(ctx.state, OpShiftRightLogical, TypeU32(ctx.state), address,
 	                              ConstantU32(ctx.state, 2));
-	const auto access    = PrepareMemoryElement(ctx, mem, resource, raw_index);
+	const auto index     = EmitMemoryElementIndex(ctx.state, resource, raw_index);
 	return EmitValueOrZeroIfCondition(
-	    ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index), [&]() {
-		    return LoadSubwordInBounds(ctx, access.resource, address, access.index, bits,
-		                               sign_extend);
+	    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index), [&]() {
+		    return LoadSubwordInBounds(ctx, resource, address, index, bits, sign_extend);
 	    });
 }
 
@@ -362,15 +339,14 @@ uint32_t LoadSubword(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo
 	});
 }
 
-Prospero::BufferFormat BufferFormat(const ValueEmitContext& ctx, const IR::Inst& inst,
-                                    const IR::MemoryInfo& mem) {
+Prospero::BufferFormat BufferFormat(const ValueEmitContext& ctx, const IR::MemoryInfo& mem) {
 	return mem.typed ? Format::DecodeTBufferFormat(mem.data_format, mem.number_format)
 	                 : StorageBufferFormat(ctx.state, mem);
 }
 
-IR::MemoryInfo RebaseFormattedComponent(IR::MemoryInfo mem, Prospero::BufferFormat format,
+IR::MemoryInfo RebaseFormattedComponent(IR::MemoryInfo mem, const Format::BufferFormatInfo& info,
                                         uint32_t component) {
-	mem.offset += Format::GetFormatComponentByteOffset(format, component);
+	mem.offset += Format::GetFormatComponentByteOffset(info, component);
 	mem.data_dwords     = 1u;
 	mem.component_index = component;
 	return mem;
@@ -383,12 +359,8 @@ IR::MemoryInfo RebaseRawComponent(IR::MemoryInfo mem, uint32_t component) {
 	return mem;
 }
 
-enum class FormattedSourceKind { Memory, Zero, One };
-
-struct FormattedSource {
-	FormattedSourceKind kind      = FormattedSourceKind::Zero;
-	uint32_t            component = 0;
-};
+using Format::FormattedSource;
+using Format::FormattedSourceKind;
 
 FormattedSource ResolveFormattedSource(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
                                        const Format::BufferFormatInfo& info,
@@ -400,29 +372,22 @@ FormattedSource ResolveFormattedSource(ValueEmitContext& ctx, const IR::MemoryIn
 	}
 	const auto selector = GetDstSel(ctx.state.program.info.buffers[mem.resource].descriptor_swizzle,
 	                                output_component);
-	if (selector == 0u) return {};
-	if (selector == 1u) return {FormattedSourceKind::One, 0};
-	if (selector < 4u) {
+	const auto source = Format::ResolveFormattedSource(info, selector);
+	if (source.kind == FormattedSourceKind::Invalid) {
 		ExitDescriptorBindingFailure(ctx.state, IR::DescriptorBindingKind::Buffers, mem.resource,
 		                             "buffer descriptor has reserved dst_sel");
 	}
-	const auto component = selector - 4u;
-	return component < info.component_count
-	           ? FormattedSource {FormattedSourceKind::Memory, component}
-	           : FormattedSource {};
+	return source;
 }
 
 uint32_t FormattedConstant(ValueEmitContext& ctx, const Format::BufferFormatInfo& info,
                            FormattedSourceKind kind) {
-	if (kind != FormattedSourceKind::One) return ConstantU32(ctx.state, 0);
-	const auto integer =
-	    info.type == Format::ComponentType::Uint || info.type == Format::ComponentType::Sint;
-	return ConstantU32(ctx.state, integer ? 1u : 0x3f800000u);
+	return ConstantU32(ctx.state, Format::FormattedConstantBits(info, kind));
 }
 
 template <typename LoadWordFn, typename LoadSubwordFn>
 uint32_t LoadFormattedComponent(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
-                                Prospero::BufferFormat format, const Format::BufferFormatInfo& info,
+                                const Format::BufferFormatInfo& info,
                                 uint32_t output_component, LoadWordFn&& load_word,
                                 LoadSubwordFn&& load_subword) {
 	const auto source = ResolveFormattedSource(ctx, mem, info, output_component);
@@ -457,19 +422,18 @@ uint32_t LoadFormattedComponent(ValueEmitContext& ctx, const IR::MemoryInfo& mem
 uint32_t FormattedLoadPrepared(ValueEmitContext& ctx, const IR::Inst& inst,
                                const IR::MemoryInfo& mem, uint32_t output_component,
                                const MemoryResourceAccess& resource) {
-	const auto format = BufferFormat(ctx, inst, mem);
-	if (!Format::IsKnownFormat(format)) {
+	const auto info = Format::GetFormatInfo(BufferFormat(ctx, mem));
+	if (info.type == Format::ComponentType::Unknown) {
 		return LoadWordPrepared(ctx, inst, RebaseRawComponent(mem, output_component), resource);
 	}
-	const auto info = Format::GetFormatInfo(format);
 	return LoadFormattedComponent(
-	    ctx, mem, format, info, output_component,
+	    ctx, mem, info, output_component,
 	    [&](uint32_t component) {
-		    return LoadWordPrepared(ctx, inst, RebaseFormattedComponent(mem, format, component),
+		    return LoadWordPrepared(ctx, inst, RebaseFormattedComponent(mem, info, component),
 		                            resource);
 	    },
 	    [&](uint32_t component, uint32_t bits, bool sign_extend) {
-		    return LoadSubwordPrepared(ctx, inst, RebaseFormattedComponent(mem, format, component),
+		    return LoadSubwordPrepared(ctx, inst, RebaseFormattedComponent(mem, info, component),
 		                               resource, bits, sign_extend);
 	    });
 }
@@ -515,10 +479,10 @@ void StoreSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR:
 	const auto address   = ByteAddress(ctx, inst, mem);
 	const auto raw_index = Binary(ctx.state, OpShiftRightLogical, TypeU32(ctx.state), address,
 	                              ConstantU32(ctx.state, 2));
-	const auto access    = PrepareMemoryElement(ctx, mem, resource, raw_index);
+	const auto index     = EmitMemoryElementIndex(ctx.state, resource, raw_index);
 	EmitIfCondition(
-	    ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index), [&]() {
-		    StoreSubwordInBounds(ctx, mem, access.resource, address, access.index, bits, data);
+	    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index), [&]() {
+		    StoreSubwordInBounds(ctx, mem, resource, address, index, bits, data);
 	    });
 }
 
@@ -531,12 +495,11 @@ void StoreSubword(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo me
 
 void StoreWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                        const MemoryResourceAccess& resource, uint32_t data) {
-	const auto access = PrepareMemoryElement(ctx, mem, resource, DwordIndex(ctx, inst, mem));
+	const auto index = EmitMemoryElementIndex(ctx.state, resource, DwordIndex(ctx, inst, mem));
 	EmitIfCondition(
-	    ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index), [&]() {
+	    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index), [&]() {
 		    ctx.state.builder.AddFunction(
-		        {OpStore, EmitMemoryElementPointer(ctx.state, access.resource, access.index),
-		         data});
+		        {OpStore, EmitMemoryElementPointer(ctx.state, resource, index), data});
 	    });
 }
 
@@ -556,15 +519,14 @@ void StoreWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) 
 void FormattedStorePrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                             uint32_t component, const MemoryResourceAccess& resource,
                             uint32_t data) {
-	const auto format = BufferFormat(ctx, inst, mem);
-	if (!Format::IsKnownFormat(format)) {
+	const auto info = Format::GetFormatInfo(BufferFormat(ctx, mem));
+	if (info.type == Format::ComponentType::Unknown) {
 		StoreWordPrepared(ctx, inst, RebaseRawComponent(mem, component), resource, data);
 		return;
 	}
-	const auto info = Format::GetFormatInfo(format);
 	if (component >= info.component_count) return;
 	const auto bits          = info.component_bits[component];
-	const auto component_mem = RebaseFormattedComponent(mem, format, component);
+	const auto component_mem = RebaseFormattedComponent(mem, info, component);
 	if (bits == 8u || bits == 16u) {
 		StoreSubwordPrepared(ctx, inst, component_mem, resource, bits, data);
 	} else {
@@ -627,31 +589,58 @@ uint32_t EmitAtomicOperation(ValueEmitContext& ctx, const IR::Inst& inst, uint32
 	return old;
 }
 
+template <typename Fn>
+uint32_t EmitAtomicAccess(ValueEmitContext& ctx, const IR::Inst& inst,
+                          const IR::MemoryInfo& mem, Fn&& operation) {
+	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
+		const auto access = PrepareMemoryElement(ctx, mem, DwordIndex(ctx, inst, mem));
+		return EmitValueOrZeroIfCondition(
+		    ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index), [&]() {
+			    return operation(EmitMemoryElementPointer(ctx.state, access.resource, access.index));
+		    });
+	});
+}
+
 uint32_t EmitAtomic(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
-	const auto result =
-	    EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
-		    const auto access = PrepareMemoryElement(ctx, mem, DwordIndex(ctx, inst, mem));
-		    return EmitValueOrZeroIfCondition(
-		        ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index),
-		        [&]() {
-			        const auto scope =
-			            mem.kind == IR::ResourceKind::Lds ? ScopeWorkgroup : ScopeDevice;
-			        const auto pointer =
-			            EmitMemoryElementPointer(ctx.state, access.resource, access.index);
-			        const auto old = EmitAtomicOperation(ctx, inst, pointer, scope);
-			        if (mem.kind == IR::ResourceKind::Lds) {
-				        const auto semantics =
-				            MemorySemanticsAcquireRelease | MemorySemanticsWorkgroupMemory;
-				        ctx.state.builder.AddFunction({OpMemoryBarrier,
-				                                       ConstantU32(ctx.state, ScopeWorkgroup),
-				                                       ConstantU32(ctx.state, semantics)});
-			        } else {
-				        EmitDeviceAtomicMemoryBarrier(ctx.state);
-			        }
-			        return old;
-		        });
-	    });
-	return result;
+	return EmitAtomicAccess(ctx, inst, mem, [&](uint32_t pointer) {
+		const auto scope = mem.kind == IR::ResourceKind::Lds ? ScopeWorkgroup : ScopeDevice;
+		const auto old   = EmitAtomicOperation(ctx, inst, pointer, scope);
+		if (mem.kind == IR::ResourceKind::Lds) {
+			const auto semantics = MemorySemanticsAcquireRelease | MemorySemanticsWorkgroupMemory;
+			ctx.state.builder.AddFunction({OpMemoryBarrier, ConstantU32(ctx.state, scope),
+			                               ConstantU32(ctx.state, semantics)});
+		} else {
+			EmitDeviceAtomicMemoryBarrier(ctx.state);
+		}
+		return old;
+	});
+}
+
+template <typename Fn>
+uint32_t EmitAtomicUpdate(ValueEmitContext& ctx, const IR::Inst& inst,
+                          const IR::MemoryInfo& mem, Fn&& replacement) {
+	const auto value = ctx.Arg(inst, inst.NumArgs() - 2);
+	return EmitAtomicAccess(ctx, inst, mem, [&](uint32_t pointer) {
+		return AtomicUpdate(ctx.state, pointer, mem.kind, [&](uint32_t old) {
+			return replacement(ctx.state, old, value);
+		});
+	});
+}
+
+uint32_t AtomicIncrement(EmitterState& state, uint32_t old, uint32_t limit) {
+	// old >= limit ? 0 : old + 1 (unsigned).
+	const auto wrap = Binary(state, OpUGreaterThanEqual, TypeBool(state), old, limit);
+	const auto next = Binary(state, OpIAdd, TypeU32(state), old, ConstantU32(state, 1));
+	return Select(state, TypeU32(state), wrap, ConstantU32(state, 0), next);
+}
+
+uint32_t AtomicDecrement(EmitterState& state, uint32_t old, uint32_t limit) {
+	// old == 0 || old > limit ? limit : old - 1 (unsigned).
+	const auto zero  = Binary(state, OpIEqual, TypeBool(state), old, ConstantU32(state, 0));
+	const auto above = Binary(state, OpUGreaterThan, TypeBool(state), old, limit);
+	const auto wrap  = Binary(state, OpLogicalOr, TypeBool(state), zero, above);
+	const auto next  = Binary(state, OpISub, TypeU32(state), old, ConstantU32(state, 1));
+	return Select(state, TypeU32(state), wrap, limit, next);
 }
 
 uint32_t EmitBufferAtomic64(ValueEmitContext& ctx, const IR::Inst& inst,
@@ -685,17 +674,9 @@ uint32_t EmitBufferAtomic64(ValueEmitContext& ctx, const IR::Inst& inst,
 
 uint32_t FloatAtomic(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                      bool max_value) {
-	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
-		const auto access = PrepareMemoryElement(ctx, mem, DwordIndex(ctx, inst, mem));
-		return EmitValueOrZeroIfCondition(
-		    ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index), [&]() {
-			    const auto pointer =
-			        EmitMemoryElementPointer(ctx.state, access.resource, access.index);
-			    const auto source = ctx.Arg(inst, inst.NumArgs() - 2);
-			    return AtomicUpdate(ctx.state, pointer, mem.kind, [&](uint32_t old) {
-				    return EmitFloatAtomicReplacement(ctx.state, old, source, max_value);
-			    });
-		    });
+	return EmitAtomicUpdate(ctx, inst, mem, [max_value](EmitterState& state, uint32_t old,
+	                                                  uint32_t value) {
+		return EmitFloatAtomicReplacement(state, old, value, max_value);
 	});
 }
 
@@ -731,6 +712,9 @@ uint32_t SharedFloatAtomic(ValueEmitContext& ctx, const IR::Inst& inst, const IR
 
 uint32_t AppendConsume(ValueEmitContext& ctx, const IR::Inst& inst, bool append) {
 	auto&      state = ctx.state;
+	if (ctx.half == 1) {
+		return ctx.other_half->Def(IR::Value(const_cast<IR::Inst*>(&inst)));
+	}
 	const auto m0    = ctx.Arg(inst, 0);
 	const auto base =
 	    Binary(state, OpShiftRightLogical, TypeU32(state), m0, ConstantU32(state, 16));
@@ -743,9 +727,7 @@ uint32_t AppendConsume(ValueEmitContext& ctx, const IR::Inst& inst, bool append)
 	const auto access = PrepareMemoryResourceAccess(state, mem);
 	const auto index  = EmitMemoryElementIndex(state, access, raw_index);
 	const auto exec   = ctx.Arg(inst, 1);
-	const auto ballot = state.builder.AllocateId();
-	state.builder.AddFunction({OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot,
-	                           ConstantU32(state, ScopeSubgroup), exec});
+	const auto ballot = ctx.Ballot(inst.Arg(1));
 	const auto low  = state.builder.AllocateId();
 	const auto high = state.builder.AllocateId();
 	state.builder.AddFunction({OpCompositeExtract, TypeU32(state), low, ballot, 0});
@@ -753,11 +735,12 @@ uint32_t AppendConsume(ValueEmitContext& ctx, const IR::Inst& inst, bool append)
 	const auto count =
 	    Binary(state, OpIAdd, TypeU32(state), Unary(state, OpBitCount, TypeU32(state), low),
 	           Unary(state, OpBitCount, TypeU32(state), high));
-	const auto first = state.builder.AllocateId();
-	state.builder.AddFunction({OpGroupNonUniformBallotFindLSB, TypeU32(state), first,
-	                           ConstantU32(state, ScopeSubgroup), ballot});
+	const auto first       = ctx.FirstLane(ballot);
+	const auto source_lane = state.lane_count == 2 ? Binary(state, OpBitwiseAnd, TypeU32(state),
+	                                                        first, ConstantU32(state, 31))
+	                                               : first;
 	const auto is_first =
-	    Binary(state, OpIEqual, TypeBool(state), EmitSubgroupLocalInvocationId(state), first);
+	    Binary(state, OpIEqual, TypeBool(state), EmitSubgroupLocalInvocationId(state), source_lane);
 	const auto storage_bounds = EmitMemoryElementInBounds(state, access, index);
 	const auto m0_bounds =
 	    mem.kind == IR::ResourceKind::Gds
@@ -765,7 +748,12 @@ uint32_t AppendConsume(ValueEmitContext& ctx, const IR::Inst& inst, bool append)
 	        : Binary(state, OpULessThan, TypeBool(state),
 	                 ConstantU32(state, ctx.Memory(inst).offset + 3u), size);
 	const auto condition = AndCondition(
-	    state, is_first, AndCondition(state, exec, AndCondition(state, storage_bounds, m0_bounds)));
+	    state, is_first,
+	    AndCondition(state,
+	                 state.lane_count == 2
+	                     ? Binary(state, OpINotEqual, TypeBool(state), count, ConstantU32(state, 0))
+	                     : exec,
+	                 AndCondition(state, storage_bounds, m0_bounds)));
 	const auto atomic = EmitValueOrZeroIfCondition(state, condition, [&]() {
 		const auto value = state.builder.AllocateId();
 		state.builder.AddFunction(
@@ -777,12 +765,11 @@ uint32_t AppendConsume(ValueEmitContext& ctx, const IR::Inst& inst, bool append)
 	});
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction({OpGroupNonUniformShuffle, TypeU32(state), result,
-	                           ConstantU32(state, ScopeSubgroup), atomic, first});
+	                           ConstantU32(state, ScopeSubgroup), atomic, source_lane});
 	return result;
 }
 
 struct PreparedFormattedMemory {
-	Prospero::BufferFormat   format = Prospero::BufferFormat::kInvalid;
 	Format::BufferFormatInfo info;
 	MemoryResourceAccess     resource;
 	std::array<uint32_t, 4>  addresses {};
@@ -795,10 +782,10 @@ enum class FormattedAccess { Load, Store };
 PreparedFormattedMemory PrepareFormattedMemory(ValueEmitContext& ctx, const IR::Inst& inst,
                                                const IR::MemoryInfo&       mem,
                                                const MemoryResourceAccess& resource,
+                                               const Format::BufferFormatInfo& info,
                                                uint32_t components, FormattedAccess access) {
 	PreparedFormattedMemory plan;
-	plan.format   = BufferFormat(ctx, inst, mem);
-	plan.info     = Format::GetFormatInfo(plan.format);
+	plan.info     = info;
 	plan.resource = resource;
 	std::array<bool, 4> required_components {};
 	if (access == FormattedAccess::Load) {
@@ -817,11 +804,11 @@ PreparedFormattedMemory PrepareFormattedMemory(ValueEmitContext& ctx, const IR::
 	bool first_bound = true;
 	for (uint32_t component = 0; component < plan.info.component_count; component++) {
 		if (!required_components[component]) continue;
-		const auto byte_offset = Format::GetFormatComponentByteOffset(plan.format, component);
+		const auto byte_offset = Format::GetFormatComponentByteOffset(plan.info, component);
 		bool       reused      = false;
 		for (uint32_t previous = 0; previous < component; previous++) {
 			if (required_components[previous] &&
-			    Format::GetFormatComponentByteOffset(plan.format, previous) == byte_offset) {
+			    Format::GetFormatComponentByteOffset(plan.info, previous) == byte_offset) {
 				plan.addresses[component] = plan.addresses[previous];
 				plan.indices[component]   = plan.indices[previous];
 				reused                    = true;
@@ -829,7 +816,7 @@ PreparedFormattedMemory PrepareFormattedMemory(ValueEmitContext& ctx, const IR::
 			}
 		}
 		if (reused) continue;
-		const auto component_mem  = RebaseFormattedComponent(mem, plan.format, component);
+		const auto component_mem  = RebaseFormattedComponent(mem, plan.info, component);
 		plan.addresses[component] = ByteAddress(ctx, inst, component_mem);
 		const auto raw_index      = Binary(ctx.state, OpShiftRightLogical, TypeU32(ctx.state),
 		                                   plan.addresses[component], ConstantU32(ctx.state, 2));
@@ -850,7 +837,7 @@ PreparedFormattedMemory PrepareFormattedMemory(ValueEmitContext& ctx, const IR::
 uint32_t LoadFormattedInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
                                const PreparedFormattedMemory& plan, uint32_t output_component) {
 	return LoadFormattedComponent(
-	    ctx, mem, plan.format, plan.info, output_component,
+	    ctx, mem, plan.info, output_component,
 	    [&](uint32_t component) {
 		    return LoadWordInBounds(ctx, plan.resource, plan.indices[component]);
 	    },
@@ -899,10 +886,10 @@ uint32_t LoadWideBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t co
 	    ConstantU32CompositeZero(state, components), [&]() {
 		    const auto mem      = ctx.Memory(inst);
 		    const auto resource = PrepareMemoryResourceAccess(state, mem);
-		    const auto format =
-		        mem.formatted ? BufferFormat(ctx, inst, mem) : Prospero::BufferFormat::kInvalid;
-		    if (Format::IsKnownFormat(format)) {
-			    const auto plan = PrepareFormattedMemory(ctx, inst, mem, resource, components,
+		    const auto info = Format::GetFormatInfo(
+		        mem.formatted ? BufferFormat(ctx, mem) : Prospero::BufferFormat::kInvalid);
+		    if (info.type != Format::ComponentType::Unknown) {
+			    const auto plan = PrepareFormattedMemory(ctx, inst, mem, resource, info, components,
 			                                             FormattedAccess::Load);
 			    return EmitValueOrDefaultIfCondition(
 			        state, plan.in_bounds, TypeU32Composite(state, components),
@@ -929,10 +916,10 @@ void StoreWideBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compo
 		const auto mem       = ctx.Memory(inst);
 		const auto resource  = PrepareMemoryResourceAccess(state, mem);
 		const auto composite = ctx.Arg(inst, inst.NumArgs() - 2);
-		const auto format =
-		    mem.formatted ? BufferFormat(ctx, inst, mem) : Prospero::BufferFormat::kInvalid;
-		if (Format::IsKnownFormat(format)) {
-			const auto plan = PrepareFormattedMemory(ctx, inst, mem, resource, components,
+		const auto info = Format::GetFormatInfo(
+		    mem.formatted ? BufferFormat(ctx, mem) : Prospero::BufferFormat::kInvalid);
+		if (info.type != Format::ComponentType::Unknown) {
+			const auto plan = PrepareFormattedMemory(ctx, inst, mem, resource, info, components,
 			                                         FormattedAccess::Store);
 			EmitIfCondition(state, plan.in_bounds, [&]() {
 				for (uint32_t component = 0; component < components; component++) {
@@ -968,10 +955,10 @@ uint32_t LoadWideShared(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t co
 			                                                    ConstantU32(state, component * 4u));
 			    const auto raw_index = Binary(state, OpShiftRightLogical, TypeU32(state), address,
 			                                  ConstantU32(state, 2));
-			    const auto access    = PrepareMemoryElement(ctx, mem, resource, raw_index);
+			    const auto index     = EmitMemoryElementIndex(state, resource, raw_index);
 			    values[component]    = EmitValueOrZeroIfCondition(
-			        state, EmitMemoryElementInBounds(state, access.resource, access.index),
-			        [&]() { return LoadWordInBounds(ctx, access.resource, access.index); });
+			        state, EmitMemoryElementInBounds(state, resource, index),
+			        [&]() { return LoadWordInBounds(ctx, resource, index); });
 		    }
 		    return ConstructU32Composite(state, components, values);
 	    });
@@ -989,11 +976,10 @@ void StoreWideShared(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compo
 			                                              ConstantU32(state, component * 4u));
 			const auto raw_index =
 			    Binary(state, OpShiftRightLogical, TypeU32(state), address, ConstantU32(state, 2));
-			const auto access = PrepareMemoryElement(ctx, mem, resource, raw_index);
-			EmitIfCondition(state, EmitMemoryElementInBounds(state, access.resource, access.index),
+			const auto index = EmitMemoryElementIndex(state, resource, raw_index);
+			EmitIfCondition(state, EmitMemoryElementInBounds(state, resource, index),
 			                [&]() {
-				                StoreWordInBounds(ctx, access.resource, access.index,
-				                                  ctx.Arg(inst, component + 1u));
+				                StoreWordInBounds(ctx, resource, index, ctx.Arg(inst, component + 1u));
 			                });
 		}
 	});
@@ -1169,6 +1155,12 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (op == IR::ValueOpcode::BufferAtomicFMin32 || op == IR::ValueOpcode::BufferAtomicFMax32) {
 		ctx.Define(inst, FloatAtomic(ctx, inst, ctx.Memory(inst),
 		                             op == IR::ValueOpcode::BufferAtomicFMax32));
+		return true;
+	}
+	if (op == IR::ValueOpcode::SharedAtomicInc32 || op == IR::ValueOpcode::SharedAtomicDec32) {
+		const auto replacement = op == IR::ValueOpcode::SharedAtomicInc32
+		                             ? AtomicIncrement : AtomicDecrement;
+		ctx.Define(inst, EmitAtomicUpdate(ctx, inst, ctx.Memory(inst), replacement));
 		return true;
 	}
 	if (op == IR::ValueOpcode::SharedAtomicFMin32 || op == IR::ValueOpcode::SharedAtomicFMax32) {

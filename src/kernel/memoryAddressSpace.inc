@@ -375,10 +375,6 @@ public:
 		const uint64_t old_end    = old.vaddr + old.size;
 		const uint64_t right_size = old_end - right_addr;
 
-		// The whole view goes away while the kept parts are mapped again; guest threads that
-		// touch the kept parts meanwhile wait for this scope (see WaitForMappingTransition).
-		MappingTransitionScope transition(old.vaddr, old.size);
-
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		if (UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size)) {
 			bool ok = true;

@@ -136,39 +136,6 @@ bool DecodeBufferDescriptor(const DescriptorValue& descriptor, ShaderBufferResou
 	return true;
 }
 
-uint64_t ScalarBufferSize(const ShaderBufferResource& descriptor);
-
-bool ValidBufferDescriptor(const DescriptorValue& descriptor, ShaderType stage,
-                           const SrtRuntime& runtime, ShaderBufferResource& result) {
-	if (!DecodeBufferDescriptor(descriptor, result) || result.Type() != 0 ||
-	    (stage != ShaderType::Compute && result.AddTid())) {
-		return false;
-	}
-	for (uint32_t component = 0; component < 4u; component++) {
-		const auto selector = (result.DstSelXYZW() >> (component * 3u)) & 0x7u;
-		if (selector == 2u || selector == 3u) {
-			return false;
-		}
-	}
-	if (runtime.validate_memory_range == nullptr) {
-		return true;
-	}
-	// Tracking is static, so a resource that is inactive on the current path can have undefined
-	// descriptor registers. Canonicalize those values before they affect specialization.
-	const auto size = ScalarBufferSize(result);
-	return result.Base48() != 0 && size != 0 &&
-	       runtime.validate_memory_range(runtime.userdata, result.Base48(), size);
-}
-
-bool ValidSamplerDescriptor(const DescriptorValue& descriptor, ShaderSamplerResource& result) {
-	if (descriptor.dword_count != std::size(result.fields)) {
-		return false;
-	}
-	std::copy_n(descriptor.dwords.begin(), std::size(result.fields), result.fields);
-	return result.MaxAnisoRatio() <= static_cast<uint32_t>(Prospero::SamplerAnisoRatio::kSixteen) &&
-	       result.MipFilter() <= static_cast<uint32_t>(Prospero::SamplerMipFilter::kLinear);
-}
-
 const DescriptorSource* Source(const ResourcePlan& program, uint32_t source) {
 	if (source >= program.descriptor_sources.size()) {
 		return nullptr;
@@ -326,27 +293,37 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& r
 	}
 	std::vector<DescriptorValue> values;
 	std::vector<uint32_t>        flattened_srt;
+	std::vector<uint8_t>         active_sources;
 	if (!EvaluateRuntimeSources(program, program.materialization_sources, runtime, values,
-	                            flattened_srt, program.clean_flat_slots)) {
+	                            flattened_srt, program.clean_flat_slots, active_sources)) {
 		return false;
 	}
 
-	auto& next   = snapshot.resources;
-	auto  cursor = values.begin();
+	auto&                   next  = snapshot.resources;
+	const auto&             fill  = program.uniform_fill;
+	const auto              words = fill.fill.words;
+	std::array<uint32_t, 4> stored {};
+	if (words != 0 &&
+	    EvaluateUniformValues(program, std::span(fill.values).first(words), runtime,
+	                          std::span(stored).first(words)) &&
+	    std::all_of(stored.begin(), stored.begin() + words,
+	                [&](uint32_t value) { return value == stored[0]; })) {
+		next.uniform_fill       = fill.fill;
+		next.uniform_fill.value = stored[0];
+	}
+	auto cursor = values.begin();
 	next.buffers.assign(cursor, cursor + program.info.buffers.size());
 	cursor += program.info.buffers.size();
-	for (auto& descriptor: next.buffers) {
-		ShaderBufferResource buffer;
-		if (!ValidBufferDescriptor(descriptor, program.stage, runtime, buffer)) {
-			descriptor.dwords.fill(0);
-		}
-	}
 	next.flattened_srt = std::move(flattened_srt);
 	next.images.resize(program.info.images.size());
 	for (uint32_t image_index = 0; image_index < program.info.images.size(); image_index++) {
 		const auto& image  = program.info.images[image_index];
 		const auto* source = Source(program, image.source);
 		if (source != nullptr && source->indirect_image.has_value()) {
+			if (!active_sources[image.source]) {
+				next.images[image_index].dword_count = 8u;
+				continue;
+			}
 			const std::array requests {source->indirect_image->material_source,
 			                           source->indirect_image->heap_source};
 			SrtRuntime       clean_runtime = runtime;
@@ -376,12 +353,6 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& r
 		}
 	}
 	next.samplers.assign(cursor, cursor + program.info.samplers.size());
-	for (auto& descriptor: next.samplers) {
-		ShaderSamplerResource sampler;
-		if (!ValidSamplerDescriptor(descriptor, sampler)) {
-			descriptor.dwords.fill(0);
-		}
-	}
 	next.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
 	return true;
 }
@@ -389,6 +360,28 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& r
 struct SamplerPlan {
 	std::array<uint32_t, ShaderInfo::MaxSamplers> point_sampler {};
 	uint32_t                                      sampler_count = 0;
+};
+
+struct ImageRemap {
+	explicit ImageRemap(const ResourceSpecialization& specialization) {
+		for (const auto& image: specialization.images) {
+			indices.push_back(image.fmask ? UINT32_MAX : count++);
+		}
+	}
+
+	template <typename T>
+	void Apply(std::vector<T>& images) const {
+		EXIT_IF(images.size() != indices.size());
+		for (uint32_t index = 0; index < indices.size(); index++) {
+			if (indices[index] != UINT32_MAX && indices[index] != index) {
+				images[indices[index]] = std::move(images[index]);
+			}
+		}
+		images.resize(count);
+	}
+
+	std::vector<uint32_t> indices;
+	uint32_t              count = 0;
 };
 
 template <typename Images>
@@ -524,6 +517,15 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 			                static_cast<uint32_t>(format)));
 		}
 		const bool storage      = base.resource_class == ImageResourceClass::Storage;
+		image.fmask             = Prospero::IsFmaskTextureFormat(format);
+		if (image.fmask) {
+			if (storage || base.depth_compare ||
+			    image.indirect_root != ImageResource::NoIndirectImage ||
+			    std::ranges::any_of(program.info.sampled_pairs,
+			                        [&](const auto& pair) { return pair.image == i; })) {
+				return SpecializationFail("FMASK requires a direct image load");
+			}
+		}
 		image.conversion_format = ImageConversionFormat(format);
 		if (storage || image.conversion_format != Prospero::BufferFormat::kInvalid) {
 			image.shader_swizzle = DescriptorImageSwizzle(descriptor);
@@ -614,6 +616,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 			next_snapshot.samplers.push_back(next_snapshot.samplers[index]);
 		}
 	}
+	ImageRemap(next_specialization).Apply(next_snapshot.images);
 	specialization       = std::move(next_specialization);
 	specialized_snapshot = std::move(next_snapshot);
 	return true;
@@ -647,6 +650,228 @@ bool BuildSamplerPlan(const ShaderInfo& base, const Images& images, SamplerPlan&
 		}
 	}
 	return true;
+}
+
+static std::vector<ResourceBlock> ResourceControlFlow(const Program& program) {
+	if (program.blocks.size() != program.block_info.size()) {
+		return {};
+	}
+	std::unordered_map<uint32_t, uint32_t> indices;
+	for (uint32_t i = 0; i < program.block_info.size(); i++) {
+		if (!indices.emplace(program.block_info[i].id, i).second) {
+			return {};
+		}
+	}
+	std::vector<ResourceBlock> blocks(program.blocks.size());
+	for (uint32_t i = 0; i < blocks.size(); i++) {
+		auto&                 block      = blocks[i];
+		const auto&           info       = program.block_info[i];
+		const auto&           terminator = info.terminator;
+		std::vector<uint32_t> successors;
+		switch (terminator.kind) {
+			case CFG::TerminatorKind::Branch: successors.push_back(terminator.true_block); break;
+			case CFG::TerminatorKind::ConditionalBranch:
+				successors = {terminator.true_block, terminator.false_block};
+				if (ValidateRuntimeValue(program, info.condition, RuntimeValueType::Integer)) {
+					block.condition = info.condition;
+				}
+				break;
+			case CFG::TerminatorKind::IndirectBranch:
+				successors = terminator.indirect_targets;
+				break;
+			case CFG::TerminatorKind::Return: break;
+			default: return {};
+		}
+		for (const auto successor: successors) {
+			const auto found = indices.find(successor);
+			if (found == indices.end()) {
+				return {};
+			}
+			block.successors.push_back(found->second);
+		}
+		for (const auto& inst: *program.blocks[i]) {
+			const auto op     = inst.GetOpcode();
+			const auto buffer = BufferAccessOf(op);
+			const auto image  = ImageOpcodeInfoOf(op);
+			// Any shader write may alias a scalar predicate read, including on a later loop visit.
+			if (buffer == BufferAccess::Write || buffer == BufferAccess::Atomic ||
+			    image.access == ImageAccess::Write || image.access == ImageAccess::Atomic ||
+			    AddressOpcodeInfoOf(op).access == AddressAccess::Write) {
+				return {};
+			}
+			if (buffer == BufferAccess::None && image.access == ImageAccess::None) {
+				continue;
+			}
+			const auto& memory = program.memory_info.at(inst.Flags<MemoryFlags>().index);
+			if (memory.planning_only) {
+				continue;
+			}
+			if (buffer != BufferAccess::None) {
+				block.sources.push_back(program.info.buffers.at(memory.resource).source);
+			} else {
+				block.sources.push_back(program.info.images.at(memory.resource).source);
+				if (image.needs_sampler) {
+					block.sources.push_back(program.info.samplers.at(memory.sampler).source);
+				}
+			}
+		}
+		std::ranges::sort(block.sources);
+		block.sources.erase(std::unique(block.sources.begin(), block.sources.end()),
+		                    block.sources.end());
+	}
+	if (std::ranges::none_of(
+	        blocks, [](const ResourceBlock& block) { return !block.condition.IsEmpty(); })) {
+		return {};
+	}
+	return blocks;
+}
+
+// Nonnegative affine coefficients for constant, local and workgroup coordinates. Reject modular
+// arithmetic that could wrap; runtime coverage also bounds the largest invocation index.
+static std::optional<std::array<uint64_t, 3>> FillIndex(Value value, uint32_t axis,
+                                                      uint32_t depth = 0) {
+	value = value.Resolve();
+	if (depth > 32 || value.GetType() != Type::U32) {
+		return {};
+	}
+	if (value.IsImmediate()) {
+		return std::array<uint64_t, 3> {value.U32(), 0, 0};
+	}
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr) {
+		return {};
+	}
+	const auto op = inst->GetOpcode();
+	if (op == ValueOpcode::GetBuiltin && inst->Arg(1) == Value(axis)) {
+		if (inst->Arg(0) == Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId))) {
+			return std::array<uint64_t, 3> {0, 1, 0};
+		}
+		if (inst->Arg(0) == Value(static_cast<uint32_t>(StageInputKind::WorkgroupId))) {
+			return std::array<uint64_t, 3> {0, 0, 1};
+		}
+	}
+	if (op != ValueOpcode::IAdd32 && op != ValueOpcode::IMul32 &&
+	    op != ValueOpcode::ShiftLeftLogical32) {
+		return {};
+	}
+	auto left  = FillIndex(inst->Arg(0), axis, depth + 1);
+	auto right = FillIndex(inst->Arg(1), axis, depth + 1);
+	if (!left || !right) {
+		return {};
+	}
+	if (op == ValueOpcode::IMul32 && ((*right)[1] != 0 || (*right)[2] != 0)) {
+		std::swap(left, right);
+	}
+	if (op != ValueOpcode::IAdd32 && ((*right)[1] != 0 || (*right)[2] != 0)) {
+		return {};
+	}
+	if (op == ValueOpcode::ShiftLeftLogical32) {
+		if ((*right)[0] >= 32) return {};
+		(*right)[0] = uint64_t {1} << (*right)[0];
+	}
+	for (uint32_t i = 0; i < left->size(); ++i) {
+		(*left)[i] =
+		    op == ValueOpcode::IAdd32 ? (*left)[i] + (*right)[i] : (*left)[i] * (*right)[0];
+		if ((*left)[i] > UINT32_MAX) return {};
+	}
+	return left;
+}
+
+static UniformFillPlan AnalyzeUniformFill(const Program& program) {
+	if (program.stage != ShaderType::Compute || program.blocks.empty() ||
+	    program.blocks.size() != program.block_info.size() || program.info.uses_dma ||
+	    !program.info.samplers.empty()) {
+		return {};
+	}
+	std::unordered_set<uint32_t> visited;
+	uint32_t                     index = 0;
+	const Inst*                  store = nullptr;
+	for (;;) {
+		if (!visited.insert(index).second) return {};
+		for (const auto& inst: *program.blocks[index]) {
+			if (AddressOpcodeInfoOf(inst.GetOpcode()).access != AddressAccess::None) return {};
+			if (!inst.MayHaveSideEffects()) continue;
+			if (store != nullptr || (BufferAccessOf(inst.GetOpcode()) != BufferAccess::Write &&
+			                         inst.GetOpcode() != ValueOpcode::ImageWrite))
+				return {};
+			store = &inst;
+		}
+		const auto& term = program.block_info[index].terminator;
+		if (term.kind == CFG::TerminatorKind::Return) break;
+		if (term.kind != CFG::TerminatorKind::Branch) return {};
+		const auto next = std::ranges::find(program.block_info, term.true_block, &BlockInfo::id);
+		if (next == program.block_info.end()) return {};
+		index = static_cast<uint32_t>(next - program.block_info.begin());
+	}
+	if (store == nullptr || visited.size() != program.blocks.size()) return {};
+	for (const auto& buffer: program.info.buffers) {
+		if (buffer.read && (!buffer.scalar || buffer.written)) return {};
+	}
+	const auto& memory = program.memory_info.at(store->Flags<MemoryFlags>().index);
+	UniformFillPlan result;
+	result.fill.resource = memory.resource;
+	Value data;
+	if (store->GetOpcode() == ValueOpcode::ImageWrite) {
+		if (program.info.images.size() != 1 || memory.dmask != 1 || memory.data_bits != 32 ||
+		    memory.image_has_mip || memory.image_sample_flags != 0 || memory.image_r128 ||
+		    memory.image_dimension != Decoder::ImageDimension::Dim2DArray ||
+		    store->Arg(3).Resolve() != Value(true)) return {};
+		const auto& image = program.info.images[memory.resource];
+		if (image.read || image.atomic || image.mip_mode != ImageMipMode::None) return {};
+		const auto* address = store->Arg(1).ResolveInstruction();
+		if (address == nullptr || address->GetOpcode() != ValueOpcode::MakeImageAddress) return {};
+		for (uint32_t axis = 0; axis < 3; ++axis) {
+			const auto index = FillIndex(address->Arg(axis), axis);
+			if (!index || (*index)[0] != 0) return {};
+			if (axis < 2) {
+				if ((*index)[1] != 1 || (*index)[2] == 0) return {};
+			} else if ((*index)[1] != 0 || (*index)[2] != 1) {
+				return {};
+			}
+			result.fill.group_stride[axis] = static_cast<uint32_t>((*index)[2]);
+		}
+		const auto* values = store->Arg(2).ResolveInstruction();
+		if (values == nullptr || values->GetOpcode() != ValueOpcode::CompositeConstructU32x4)
+			return {};
+		result.fill.kind  = UniformFillKind::Image;
+		result.fill.words = 1;
+		data = values->Arg(0);
+	} else {
+		if (!program.info.images.empty()) return {};
+		const auto           op = store->GetOpcode();
+		constexpr std::array stores {ValueOpcode::StoreBufferU32, ValueOpcode::StoreBufferU32x2,
+		                             ValueOpcode::StoreBufferU32x3, ValueOpcode::StoreBufferU32x4};
+		const auto           store_op = std::ranges::find(stores, op);
+		if (store_op == stores.end() || store->Arg(2).Resolve() != Value(0u) ||
+		    store->Arg(3).Resolve() != Value(0u) || store->Arg(5).Resolve() != Value(true))
+			return {};
+		if (!memory.formatted || memory.typed || !memory.idxen || memory.offen || memory.offset != 0 ||
+		    memory.data_bits != 32 ||
+		    memory.data_dwords != static_cast<uint32_t>(store_op - stores.begin() + 1))
+			return {};
+		const auto address = FillIndex(store->Arg(1), 0);
+		if (!address || (*address)[0] != 0 || (*address)[1] != 1 || (*address)[2] == 0) return {};
+		result.fill.kind = UniformFillKind::Buffer;
+		result.fill.group_stride[0] = static_cast<uint32_t>((*address)[2]);
+		result.fill.words = memory.data_dwords;
+		data = store->Arg(4);
+	}
+	data = data.Resolve();
+	const auto*          vector = data.TryInstruction();
+	constexpr std::array composites {ValueOpcode::CompositeConstructU32x2,
+	                                 ValueOpcode::CompositeConstructU32x3,
+	                                 ValueOpcode::CompositeConstructU32x4};
+	if (result.fill.words > 1 &&
+	    (vector == nullptr || vector->GetOpcode() != composites[result.fill.words - 2]))
+		return {};
+	for (uint32_t i = 0; i < result.fill.words; ++i) {
+		const auto word = result.fill.words == 1 ? data : vector->Arg(i);
+		if (word.GetType() != Type::U32 ||
+		    !ValidateRuntimeValue(program, word, RuntimeValueType::Integer))
+			return {};
+		result.values[i] = word;
+	}
+	return result;
 }
 
 ResourcePlan ExtractResourcePlan(const Program& program) {
@@ -704,6 +929,14 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	for (const auto& read: program.srt_reads) {
 		plan.srt_reads.push_back({Clone(read.value), read.flat_offset});
 	}
+	plan.control_flow = ResourceControlFlow(program);
+	for (auto& block: plan.control_flow) {
+		block.condition = Clone(block.condition);
+	}
+	plan.uniform_fill = AnalyzeUniformFill(program);
+	for (uint32_t i = 0; i < plan.uniform_fill.fill.words; ++i) {
+		plan.uniform_fill.values[i] = Clone(plan.uniform_fill.values[i]);
+	}
 	plan.materialization_sources.reserve(plan.info.buffers.size() + plan.info.images.size() +
 	                                     plan.info.samplers.size());
 	for (const auto& buffer: plan.info.buffers) {
@@ -731,11 +964,6 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		MarkCleanFlatSlots(plan, Source(plan, source->indirect_image->heap_source),
 		                   plan.clean_flat_slots);
 	}
-	uint32_t slot = 0;
-	for (auto& inst: plan.value_storage) {
-		inst.SetEvalSlot(slot++);
-	}
-	plan.eval_slot_count = slot;
 	return plan;
 }
 
@@ -816,8 +1044,10 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 	}
 
 	auto memory_info = program.memory_info;
-	for (const auto* block: program.blocks) {
-		for (const auto& inst: *block) {
+	const ImageRemap image_remap(specialization);
+	for (auto* block: program.blocks) {
+		for (auto it = block->begin(); it != block->end(); ++it) {
+			auto& inst = *it;
 			const auto image_opcode = ImageOpcodeInfoOf(inst.GetOpcode());
 			if (image_opcode.access == ImageAccess::None) {
 				continue;
@@ -827,6 +1057,23 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 			auto& memory = memory_info[index];
 			EXIT_IF(memory.resource >= images.size());
 			const auto& image = images[memory.resource];
+			if (specialization.images[memory.resource].fmask) {
+				EXIT_IF(inst.GetOpcode() != ValueOpcode::ImageRead || memory.data_bits != 32u);
+				// Vulkan MSAA stores each sample directly; FMASK's four-bit fragment indices
+				// therefore map each coverage sample to the same host sample.
+				constexpr uint32_t indices[] = {0x76543210u, 0xfedcba98u};
+				std::array<Value, 2> fragments;
+				for (uint32_t component = 0; component < fragments.size(); component++) {
+					const auto selected = block->PrependNewInst(
+					    it, ValueOpcode::SelectU32, {inst.Arg(2), Value(indices[component]), Value(0u)});
+					fragments[component] = Value(&*selected);
+				}
+				const auto result = block->PrependNewInst(
+				    it, ValueOpcode::CompositeConstructU32x4,
+				    {fragments[0], fragments[1], Value(0u), Value(0u)});
+				inst.ReplaceUsesWith(Value(&*result));
+				continue;
+			}
 			if (image_opcode.needs_sampler && RequiresPointSampler(image) &&
 			    memory.sampler < program.info.samplers.size()) {
 				EXIT_IF(sampler_plan.point_sampler[memory.sampler] == UINT32_MAX);
@@ -836,6 +1083,35 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 			        inst.GetOpcode() != ValueOpcode::ImageSampleRaw);
 		}
 	}
+	for (auto* block: program.blocks) {
+		for (auto& inst: *block) {
+			if (inst.GetOpcode() == ValueOpcode::GetImageResource) {
+				inst.SetFlags(image_remap.indices.at(inst.Flags<uint32_t>()));
+			}
+		}
+	}
+	for (auto& memory: memory_info) {
+		if (memory.kind == ResourceKind::Image && !memory.planning_only) {
+			memory.resource = image_remap.indices.at(memory.resource);
+		}
+	}
+	for (auto& buffer: buffers) {
+		if (buffer.image_alias != BufferResource::NoImageAlias) {
+			buffer.image_alias = image_remap.indices.at(buffer.image_alias);
+		}
+	}
+	for (auto& pair: sampled_pairs) {
+		pair.image = image_remap.indices.at(pair.image);
+	}
+	for (auto& image: images) {
+		if (image.indirect_root != ImageResource::NoIndirectImage) {
+			image.indirect_root = image_remap.indices.at(image.indirect_root);
+		}
+		for (auto& resource: image.indirect_resources) {
+			resource = image_remap.indices.at(resource);
+		}
+	}
+	image_remap.Apply(images);
 	program.info.buffers       = std::move(buffers);
 	program.info.images        = std::move(images);
 	program.info.samplers      = std::move(samplers);

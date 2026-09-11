@@ -32,17 +32,9 @@ public:
 	enum class BindingType : uint8_t { Texture, Storage, RenderTarget, DepthTarget, VideoOut };
 
 	struct ImageDesc {
-		ImageInfo           info;
-		ImageViewInfo       view_info;
-		BindingType         type = BindingType::Texture;
-		vk::ClearColorValue metadata_clear_value {};
-		bool                metadata_clear_supported = false;
-	};
-
-	struct RegionInfo {
-		bool image_pages     = false;
-		bool image_bytes     = false;
-		bool gpu_image_bytes = false;
+		ImageInfo     info;
+		ImageViewInfo view_info;
+		BindingType   type = BindingType::Texture;
 	};
 
 	TextureCache(GraphicContext& graphics, CommandScheduler& scheduler, PageManager& page_manager,
@@ -68,31 +60,15 @@ public:
 	                                        uint32_t packed_clear);
 	void               InvalidateMemory(uint64_t address, uint64_t size);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
-	[[nodiscard]] RegionInfo QueryRegion(uint64_t address, uint64_t size);
-	// Bumps whenever an image is freed, unregistered or its guest memory invalidated. Renderer
-	// caches holding ImageIds compare it to know their ids are still current.
-	[[nodiscard]] uint64_t MutationEpoch() const noexcept { return m_mutation_epoch; }
+	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
 
-	// Records that a metadata fill targeted an address no surface has claimed yet, without the code:
-	// the caller lets the dispatch run, so the value only exists in the allocation afterwards.
-	// No-op when anything is already tracked there.
-	void ParkMetaFill(uint64_t address);
-	// True once per parked fill, after a surface has claimed the address. The caller then reads the
-	// code from the allocation - which must happen outside this cache's lock, because a guest read can
-	// fault into the very invalidation paths that hold it.
-	[[nodiscard]] bool TakeParkedMetaProbe(uint64_t address);
 	[[nodiscard]] bool IsMeta(uint64_t address);
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice,
 	                                 uint32_t* fill_value = nullptr);
-	[[nodiscard]] bool ClearMeta(uint64_t address,
-	                             uint8_t clear_code = DCC_CODE_UNCOMPRESSED);
-	// Returns true when registered DCC absorbed the fill and the caller may skip the dispatch.
-	// False may still record PendingDcc state, but the guest dispatch must execute.
-	[[nodiscard]] bool TryConsumeDccFill(uint64_t address, uint64_t size, uint32_t fill_value);
+	[[nodiscard]] bool ClearMeta(uint64_t address);
+	// Record deferred DCC state while the original guest dispatch writes the metadata.
+	void               TrackDccFill(uint64_t address, uint64_t size, uint32_t fill_value);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
-	[[nodiscard]] bool
-	ResolveDccMetaClear(uint64_t address, uint32_t base_layer, uint32_t layer_count,
-	                    vk::ClearColorValue& clear_value);
 
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
@@ -100,12 +76,12 @@ public:
 
 private:
 	enum class TransferDirection { Upload, Download };
-	struct ColorTransferPlan;
+	struct TextureTransferPlan;
 	struct DownloadPlan;
 
 	struct MetaDataInfo {
 		// A guest metadata-fill dispatch may initialize DCC before its render target is bound.
-		// PendingDcc retains that exact fill until FindRenderTarget classifies the address,
+		// PendingDcc retains that exact fill until an image binding classifies the address,
 		// without exposing an unconfirmed buffer address to the normal metadata heuristics.
 		// Keep all surface metadata in one entry so CMask/FMask can be
 		// registered beside HTile and DCC without introducing parallel tracking paths.
@@ -115,8 +91,6 @@ private:
 		uint32_t clear_mask = 0;
 		uint32_t fill_value = 0xffffffffu;
 		uint64_t fill_size  = 0;
-		vk::ClearColorValue color_clear_value {};
-		bool                color_clear_supported = false;
 	};
 
 	struct OverlapResult {
@@ -130,11 +104,6 @@ private:
 
 	[[nodiscard]] ImageId     InsertImage(const ImageInfo& info);
 	[[nodiscard]] ImageId     GetNullImage(const ImageDesc& desc);
-	[[nodiscard]] bool        ResolveDccMetaClearLocked(uint64_t address, uint32_t base_layer,
-	                                                    uint32_t layer_count,
-	                                                    vk::ClearColorValue& clear_value,
-	                                                    bool consume);
-	[[nodiscard]] bool MaterializeDccMetaClear(ImageId id, Image& image, const ImageDesc& desc);
 	void                      RegisterImage(ImageId id);
 	void                      UnregisterImage(ImageId id);
 	void                      DeleteImage(ImageId id);
@@ -161,16 +130,20 @@ private:
 	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
 	                                                ImageId cached);
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
-	void                        RefreshImage(ImageId id, const ImageDesc& desc);
-	void                        InitializeImage(ImageId id, const ImageDesc& desc);
-	[[nodiscard]] ColorTransferPlan BuildColorTransfer(const Image& image, BindingType binding,
-	                                                   TransferDirection direction) const;
-	[[nodiscard]] DownloadPlan      BuildDownload(const Image& image) const;
-	void UploadImage(Image& image, const ImageDesc& desc, Buffer& source, uint64_t source_offset);
+	void                        RefreshImage(ImageId id);
+	void                        PrepareDccClear(ImageId id, const ImageDesc& desc);
+	void                        InitializeImage(ImageId id);
+	[[nodiscard]] TextureTransferPlan
+	BuildTextureTransfer(const Image& image, BindingType binding, TransferDirection direction) const;
+	[[nodiscard]] DownloadPlan BuildDownload(const Image& image) const;
+	void UploadImage(Image& image, Buffer& source, uint64_t source_offset);
 	void DownloadImageData(Image& image, Buffer& destination, uint64_t destination_offset,
 	                       uint64_t destination_size, DownloadPlan plan);
 	void DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset);
 	void CommitGpuWrite(Image& image);
+	// Caller holds m_lock. Volume layer ranges select depth slices.
+	void ClearImage(CommandBuffer& command, ImageId id, const vk::ImageSubresourceRange& range,
+	                const vk::ClearValue& clear);
 	void PrepareImageCopy(Image& image);
 	void RefreshCopySource(ImageId id);
 	[[nodiscard]] bool CopyD16(Image& destination, Image& source);
@@ -195,17 +168,12 @@ private:
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
-	// Metadata addresses whose fill was parked before its code could be observed. Held beside
-	// m_surface_metas rather than inside MetaDataInfo because it is transient repair bookkeeping, not
-	// durable metadata state, and it is erased wherever the metadata entry is.
-	std::unordered_set<uint64_t>                      m_parked_meta_probes;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
 	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
 	uint64_t         m_gc_tick                = 0;
 	mutable uint32_t m_image_query_epoch      = 0;
-	uint64_t         m_mutation_epoch         = 0;
 	bool             m_readback_linear_images = false;
 
 	friend struct TextureCacheTestAccess;
