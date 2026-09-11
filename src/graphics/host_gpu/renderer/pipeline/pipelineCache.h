@@ -207,6 +207,8 @@ private:
 	};
 
 	GraphicContext&               m_graphics;
+	GraphicsPipelineKey 		  m_last_graphics_key {};
+	Pipeline*            		  m_last_graphics_pipeline = nullptr;
 	std::unique_ptr<ProgramCache> m_program_cache;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
