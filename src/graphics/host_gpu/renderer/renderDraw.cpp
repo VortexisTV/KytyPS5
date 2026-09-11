@@ -568,8 +568,11 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			EXIT("mixed color/depth sample counts are unsupported: %u and %u\n", attachment_samples,
 			     depth.desc.info.samples);
 		}
-		const bool feedback = depth.depth_write_enable && pixel &&
-		    std::ranges::any_of(pixel->images, [&](const TextureBinding& binding) {
+		const auto write_aspects = depth.AttachmentWriteAspects();
+		
+		const bool feedback =
+		    pixel && write_aspects != vk::ImageAspectFlags {} &&
+			std::ranges::any_of(pixel->images, [&](const TextureBinding& binding) {
 			    if (binding.image_id != depth.image_id ||
 			        binding.desc.type != TextureCache::BindingType::Texture) {
 				    return false;
@@ -579,7 +582,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			    EXIT_IF(native == image.views.end());
 			    const auto& sampled = native->info;
 			    const auto& target = depth.desc.view_info;
-			    return (sampled.aspect & vk::ImageAspectFlagBits::eDepth) &&
+			    return static_cast<bool>(sampled.aspect & write_aspects) &&
 			           ImageRangeOverlaps(sampled.base_level, sampled.level_count,
 			                              target.base_level, target.level_count) &&
 			           ImageRangeOverlaps(sampled.base_layer, sampled.layer_count,
