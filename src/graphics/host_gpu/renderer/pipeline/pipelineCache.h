@@ -16,6 +16,9 @@
 #include <span>
 #include <type_traits>
 #include <unordered_map>
+#include <mutex>
+#include <unordered_set>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -138,12 +141,12 @@ public:
 	                                const HW::ShaderRegisters&   sh,
 	                                ShaderComputeInputInfo&      input_info);
 
-	Pipeline&
+	Pipeline*
 	CreateGraphicsPipeline(std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
-	                       const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
-	                       const ShaderPixelInputInfo* ps_input_info,
-	                       vk::PrimitiveTopology topology, bool primitive_restart_enable,
-	                       const ShaderProgram& vertex_program, const ShaderProgram& pixel_program);
+                       	const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
+                       	const ShaderPixelInputInfo* ps_input_info,
+                       	vk::PrimitiveTopology topology, bool primitive_restart_enable,
+                       	const ShaderProgram& vertex_program, const ShaderProgram& pixel_program);
 	Pipeline& CreateComputePipeline(const ShaderComputeInputInfo& input_info,
 	                                const ShaderProgram&          compute_program);
 
@@ -215,7 +218,20 @@ private:
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 	Common::Mutex m_mutex;
 
+struct CompletedPipeline {
+	GraphicsPipelineKey       key;
+	std::unique_ptr<Pipeline> pipeline;
+};
+
+	std::unordered_set<GraphicsPipelineKey, GraphicsPipelineKeyHash> m_pending_pipelines;
+
+	std::mutex                     m_completed_pipeline_mutex;
+	std::vector<CompletedPipeline> m_completed_pipelines;
+
+	bool m_async = false;
+
 	void InitializeDriverCache();
+	void DrainCompletedPipelines();
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
