@@ -119,13 +119,14 @@ struct ShaderVertexInputInfo {
 };
 
 struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
-	uint32_t           dispatch_threads_num[3]    = {0, 0, 0};
-	bool               group_id[3]                = {false, false, false};
-	bool               dispatch_thread_dimensions = false;
-	int                thread_ids_num             = 0;
-	int                workgroup_register         = 0;
-	bool               tg_size_en                 = false;
-	ShaderStageRuntime stage;
+    uint32_t           dispatch_threads_num[3]    = {0, 0, 0};
+    bool               group_id[3]                = {false, false, false};
+    bool               dispatch_thread_dimensions = false;
+    bool               needs_lds_barriers         = false;
+    int                thread_ids_num             = 0;
+    int                workgroup_register         = 0;
+    bool               tg_size_en                 = false;
+    ShaderStageRuntime stage;
 };
 
 struct ShaderPixelInputInfo {
