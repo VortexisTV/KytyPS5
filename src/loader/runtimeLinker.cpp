@@ -787,7 +787,12 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		return true;
 	}
 
-	if (info->type == Common::HostException::ExceptionType::AccessViolation) {
+if (info->type == Common::HostException::ExceptionType::AccessViolation) {
+
+	if (Libs::LibKernel::Memory::WaitForMappingTransition(info->access_violation_vaddr)) {
+		return true;
+	}
+
 		using CoreAccess = Common::HostException::AccessViolationType;
 		using GpuAccess  = Libs::Graphics::PageFaultAccess;
 		GpuAccess access;
