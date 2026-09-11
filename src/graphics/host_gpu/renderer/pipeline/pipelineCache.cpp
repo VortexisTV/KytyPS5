@@ -994,7 +994,41 @@ PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipeline(
 		EXIT_IF(attributes_num != static_cast<uint32_t>(vs_input_info.resources_num));
 	}
 
-	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
+	if (m_last_graphics_pipeline != nullptr && key == m_last_graphics_key) {
+    	return *m_last_graphics_pipeline;
+	}
+
+	if (auto iter = m_graphics_pipelines.find(key); 
+		iter != m_graphics_pipelines.end()) {
+		
+		m_last_graphics_key      = iter->first;
+		m_last_graphics_pipeline = iter->second.get();
+
+		return *iter->second;
+	}
+
+	auto cached = std::make_unique<Pipeline>();
+
+	CreatePipelineInternal(
+    		m_graphics,
+    		*cached,
+    		rendering,
+    		key.vertex_input,
+    		vs_input_info,
+    		vertex_program,
+    		ps_input_info,
+    		pixel_program,
+    		static_params,
+    		m_driver_cache);
+
+		auto [iter, inserted] =
+   	 		m_graphics_pipelines.emplace(std::move(key), std::move(cached));
+
+		EXIT_IF(!inserted);
+
+    	m_last_graphics_key      = iter->first;
+    	m_last_graphics_pipeline = iter->second.get();
+
 		return *iter->second;
 	}
 
