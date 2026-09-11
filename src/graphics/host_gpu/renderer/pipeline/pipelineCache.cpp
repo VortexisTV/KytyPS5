@@ -995,65 +995,62 @@ PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipeline(
 	}
 
 	if (m_last_graphics_pipeline != nullptr && key == m_last_graphics_key) {
-    	return *m_last_graphics_pipeline;
+		return *m_last_graphics_pipeline;
 	}
 
-	if (auto iter = m_graphics_pipelines.find(key); 
-		iter != m_graphics_pipelines.end()) {
-		
+	if (auto iter = m_graphics_pipelines.find(key);
+    	iter != m_graphics_pipelines.end()) {
+
 		m_last_graphics_key      = iter->first;
 		m_last_graphics_pipeline = iter->second.get();
 
 		return *iter->second;
 	}
 
-	auto cached = std::make_unique<Pipeline>();
-
-	CreatePipelineInternal(
-    		m_graphics,
-    		*cached,
-    		rendering,
-    		key.vertex_input,
-    		vs_input_info,
-    		vertex_program,
-    		ps_input_info,
-    		pixel_program,
-    		static_params,
-    		m_driver_cache);
-
-		auto [iter, inserted] =
-   	 		m_graphics_pipelines.emplace(std::move(key), std::move(cached));
-
-		EXIT_IF(!inserted);
-
-    	m_last_graphics_key      = iter->first;
-    	m_last_graphics_pipeline = iter->second.get();
-
-		return *iter->second;
-	}
-
 	if (graphics_debug_dump_enabled()) {
 		ShaderDbgDumpInputInfo(vs_input_info);
+
 		if (ps_active) {
 			ShaderDbgDumpInputInfo(*ps_input_info);
 		}
-		LOGF("PipelineTrace: shader modules VS=%" PRIu64 " module=%p PS=%" PRIu64 " module=%p\n",
-		     vs_id, static_cast<void*>(vertex_program.module), ps_id,
-		     static_cast<void*>(pixel_program.module));
+
+		LOGF(
+	    	"PipelineTrace: shader modules VS=%" PRIu64
+	    	" module=%p PS=%" PRIu64 " module=%p\n",
+	    	vs_id,
+	    	static_cast<void*>(vertex_program.module),
+	    	ps_id,
+	    	static_cast<void*>(pixel_program.module));
 	}
 
 	auto cached = std::make_unique<Pipeline>();
+
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
-	CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vs_input_info,
-	                       vertex_program, ps_input_info, pixel_program, static_params,
-	                       m_driver_cache);
+
+	CreatePipelineInternal(
+    	m_graphics,
+    	*cached,
+    	rendering,
+    	key.vertex_input,
+    	vs_input_info,
+    	vertex_program,
+    	ps_input_info,
+    	pixel_program,
+    	static_params,
+    	m_driver_cache);
+
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
 
-	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
+	auto [iter, inserted] =
+    	m_graphics_pipelines.emplace(std::move(key), std::move(cached));
+
 	EXIT_IF(!inserted);
+
+	m_last_graphics_key      = iter->first;
+	m_last_graphics_pipeline = iter->second.get();
 
 	return *iter->second;
 }
