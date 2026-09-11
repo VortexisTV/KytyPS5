@@ -613,22 +613,6 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
     : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
-	if (graphics.graphics_pipeline_library_enabled &&
-	    graphics.graphics_pipeline_library_fast_linking) {
-		m_graphics_library_cache =
-		    std::make_unique<GraphicsPipelineLibraryCache>(graphics, m_driver_cache);
-		PipelineCacheLog("Vulkan graphics pipeline libraries: fast-link path enabled");
-	} else {
-		PipelineCacheLog("Vulkan graphics pipeline libraries: monolithic fallback");
-	}
-	m_async = Config::AsyncShadersEnabled();
-	if (m_async) {
-		StartWorkers();
-		m_program_cache->enqueue = [this](std::function<void()> job) { EnqueueJob(std::move(job)); };
-	}
-	if (m_driver_cache != nullptr) {
-		StartSaver();
-	}
 }
 
 PipelineCache::~PipelineCache() {
