@@ -1,6 +1,7 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_PIPELINECACHE_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_PIPELINECACHE_H_
 
+#include <xxhash.h>
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
@@ -174,6 +175,11 @@ private:
 			for (std::size_t i = 0; i < sizeof(params); i++) {
 				Mix(hash, bytes[i]);
 			}
+		}
+
+		static void MixStaticParams(std::size_t& hash, const PipelineStaticParameters& params) {
+			Mix(hash,
+	    	static_cast<std::size_t>(XXH3_64bits(&params, sizeof(params))));
 		}
 
 		static void MixRendering(std::size_t& hash, const PipelineRenderingState& rendering) {
