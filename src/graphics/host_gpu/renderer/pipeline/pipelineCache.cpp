@@ -409,19 +409,6 @@ struct PipelineCache::ProgramCache {
 		completed.push_back(std::move(result));
 	}
 
-	void LogShaderCounts() const {
-		std::array<size_t, static_cast<size_t>(ShaderType::Mesh) + 1> counts {};
-		for (const auto& [key, source]: programs) {
-			counts[static_cast<size_t>(key.stage)] += source.permutations.size();
-		}
-		// Guest geometry shaders are compiled through the host mesh stage.
-		std::printf("Shaders: VS %zu | PS %zu | CS %zu | GS %zu\n",
-		            counts[static_cast<size_t>(ShaderType::Vertex)],
-		            counts[static_cast<size_t>(ShaderType::Pixel)],
-		            counts[static_cast<size_t>(ShaderType::Compute)],
-		            counts[static_cast<size_t>(ShaderType::Mesh)]);
-	}
-
 	void DrainCompleted() {
 		std::vector<AsyncResult> done;
 		{
@@ -441,7 +428,7 @@ struct PipelineCache::ProgramCache {
 			}
 			if (result.permutation) {
 				entry->second.permutations.push_back(std::move(*result.permutation));
-				LogShaderCounts();
+				++num_compiled;
 			}
 			if (const auto pending_it = pending.find(result.key); pending_it != pending.end()) {
 				std::erase(pending_it->second, result.tag);
@@ -538,7 +525,7 @@ struct PipelineCache::ProgramCache {
 		input_info.stage = {.program = &permutation.program, .resources = std::move(resources)};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
 
-		LogShaderCounts();
+		++num_compiled;
 		return permutation.handle;
 	}
 
@@ -597,6 +584,7 @@ struct PipelineCache::ProgramCache {
 	ProgramKey                                                  lookup_key;
 	vk::Device                                                  device;
 	std::atomic<uint64_t>                                       next_shader_id = 0;
+	std::atomic<uint32_t>                                       num_compiled = 0;
 	bool                                                        async = false;
 	std::mutex                                                  completed_mutex;
 	std::vector<AsyncResult>                                    completed;
