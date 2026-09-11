@@ -1130,10 +1130,24 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (log_pipeline_phase) {
 		LogDrawPhase(draw.name, "CreatePipeline");
 	}
-	auto& pipeline = m_context.GetPipelineCache().CreateGraphicsPipeline(
-	    std::span {state.color_info, state.color_count}, state.depth_info, state.vs_input_info, buffer,
-	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
-	    state.programs.vertex, state.programs.pixel);
+	auto* pipeline_ptr = m_context.GetPipelineCache().CreateGraphicsPipeline(
+    	std::span {state.color_info, state.color_count},
+    	state.depth_info,
+    	state.vs_input_info,
+    	buffer,
+    	state.ps_active ? &state.ps_input_info : nullptr,
+    	topology,
+    	primitive_restart_enable,
+    	state.programs.vertex,
+    	state.programs.pixel);
+
+	if (pipeline_ptr == nullptr) {
+		// Pipeline is compiling asynchronously.
+		// Drop this draw and retry naturally on a later frame.
+		return;
+	}
+
+	auto& pipeline = *pipeline_ptr;
 
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
