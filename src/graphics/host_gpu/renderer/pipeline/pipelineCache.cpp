@@ -460,6 +460,7 @@ struct PipelineCache::ProgramCache {
 			DrainCompleted();
 		}
 		const auto stage             = StageOf(input_info);
+		const bool use_async = async && stage != ShaderType::Compute;
 		lookup_key.stage           = stage;
 		lookup_key.hash            = params.hash;
 		lookup_key.user_data_count = static_cast<uint32_t>(params.user_data.size());
@@ -495,7 +496,7 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 
-		if (async) {
+		if (use_async) {
 			const bool has_entry = entry != programs.end();
 			const uint64_t tag = has_entry
 			                         ? HashSpecialization(specialization) * 31u + push_data_cursor + 1u
