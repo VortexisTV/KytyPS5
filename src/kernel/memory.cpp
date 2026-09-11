@@ -4346,4 +4346,39 @@ int KYTY_SYSV_ABI KernelMemoryPoolGetBlockStats(KernelMemoryPoolBlockStats* outp
 	return OK;
 }
 
+bool WaitForMappingTransition(uint64_t vaddr) noexcept {
+	const int self = Common::Thread::GetThreadIdUnique();
+
+	auto covered = [vaddr, self]() {
+		return std::any_of(
+		    g_transitions.begin(), g_transitions.end(),
+		    [vaddr, self](const auto& transition) {
+			    return transition.owner != self &&
+			           vaddr >= transition.start &&
+			           vaddr - transition.start < transition.size;
+		    });
+	};
+
+	std::unique_lock lock(g_transition_mutex);
+
+	if (!covered()) {
+		return false;
+	}
+
+	const bool finished =
+	    g_transition_cv.wait_for(
+	        lock, std::chrono::seconds(30),
+	        [&covered]() { return !covered(); });
+
+	if (!finished) {
+		std::printf(
+		    "Warning: memory mapping transition at "
+		    "0x%016" PRIx64 " timed out\n",
+		    vaddr);
+		std::fflush(stdout);
+	}
+
+	return finished;
+}
+
 } // namespace Libs::LibKernel::Memory
