@@ -6,12 +6,11 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <span>
 #include <utility>
 #include <vector>
-
-VK_DEFINE_HANDLE(VmaAllocation)
 
 namespace Libs::Graphics {
 
@@ -19,6 +18,7 @@ class CommandBuffer;
 class CommandScheduler;
 struct StreamBufferTestAccess;
 struct GraphicContext;
+struct VulkanBuffer;
 
 enum class MemoryUsage : uint8_t {
 	DeviceLocal,
@@ -42,10 +42,10 @@ public:
 	~Buffer();
 	KYTY_CLASS_NO_COPY(Buffer);
 
-	[[nodiscard]] vk::Buffer         Handle() const noexcept { return m_buffer; }
+	[[nodiscard]] vk::Buffer         Handle() const noexcept;
 	[[nodiscard]] uint64_t           Size() const noexcept { return m_size; }
 	[[nodiscard]] std::span<uint8_t> Mapped() const noexcept { return m_mapped; }
-	[[nodiscard]] bool               IsCoherent() const noexcept { return m_coherent; }
+	[[nodiscard]] bool               IsCoherent() const noexcept { return m_is_coherent; }
 	[[nodiscard]] MemoryUsage        Usage() const noexcept { return m_usage; }
 	[[nodiscard]] uint64_t           CpuAddress() const noexcept { return m_cpu_address; }
 	[[nodiscard]] vk::DeviceAddress BufferDeviceAddress() const noexcept;
@@ -53,8 +53,6 @@ public:
 		return address - m_cpu_address;
 	}
 	[[nodiscard]] bool IsInBounds(uint64_t address, uint64_t size) const noexcept;
-	void               IncreaseStreamScore(int score) noexcept { stream_score += score; }
-	[[nodiscard]] int  StreamScore() const noexcept { return stream_score; }
 	void               Write(uint64_t offset, const void* source, uint64_t size);
 	void               Flush(uint64_t offset, uint64_t size);
 	void               Invalidate(uint64_t offset, uint64_t size);
@@ -70,13 +68,28 @@ public:
 	void Fill(uint64_t offset, uint64_t size, uint32_t value);
 
 	// BufferCache state lives directly on the resource.
-	bool   is_deleted   = false;
-	int    stream_score = 0;
-	size_t lru_id       = 0;
+	bool   is_deleted = false;
+	size_t lru_id     = 0;
+	// Hot-readback tracking: once the CPU has read this buffer after a GPU write, every slice
+	// that writes it records a host-visible shadow copy so later CPU reads avoid a GPU drain.
+	bool     readback_hot        = false;
+	bool     shadow_pending      = false;
+	bool     shadow_valid        = false;
+	uint64_t last_gpu_write_tick = 0;
+	uint64_t shadow_tick         = 0;
+	uint64_t shadow_offset       = 0;
+	// GPU writes recorded since the last shadow; a CPU read overlapping one of them cannot use
+	// the shadow. Cleared when a new shadow is recorded.
+	struct HotWrite {
+		uint64_t address = 0;
+		uint64_t size    = 0;
+	};
+	std::vector<HotWrite> writes_since_shadow;
 
 protected:
 	[[nodiscard]] GraphicContext&   Graphics() const noexcept { return *m_graphics; }
 	[[nodiscard]] CommandScheduler& Scheduler() const noexcept { return *m_scheduler; }
+	[[nodiscard]] VulkanBuffer&     NativeBuffer() noexcept { return *m_buffer; }
 
 private:
 	[[nodiscard]] vk::BufferMemoryBarrier Barrier(uint64_t offset, uint64_t size,
@@ -87,12 +100,11 @@ private:
 	CommandScheduler*             m_scheduler   = nullptr;
 	MemoryUsage                   m_usage       = MemoryUsage::DeviceLocal;
 	uint64_t                      m_cpu_address = 0;
+	uint64_t                      m_size        = 0;
 	vk::DeviceAddress             m_device_address = 0;
-	vk::Buffer                    m_buffer     = nullptr;
-	VmaAllocation                 m_allocation = nullptr;
-	uint64_t                      m_size;
-	bool                          m_coherent = false;
+	std::unique_ptr<VulkanBuffer> m_buffer;
 	std::span<uint8_t>            m_mapped;
+	bool                          m_is_coherent = false;
 };
 
 class StreamBuffer final: public Buffer {
@@ -113,6 +125,7 @@ private:
 		uint64_t upper_bound = 0;
 	};
 
+	void                      ReserveWatches(std::vector<Watch>& watches, size_t grow_size);
 	[[nodiscard]] static bool NormalizeReservation(bool coherent, uint64_t atom, uint64_t& size,
 	                                               uint64_t& alignment);
 	[[nodiscard]] bool        WaitPendingOperations(const std::vector<Watch>& watches,

@@ -14,12 +14,17 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <string>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -168,6 +173,57 @@ static bool VirtualRangesOverlap(uint64_t left_start, uint64_t left_size, uint64
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 static uint32_t g_test_backing_store_unmaps_before_failure = UINT32_MAX;
 #endif
+
+// A fixed map over a live mapping, or a partial unmap of a host view, tears the host mapping down
+// and rebuilds it. Guest threads that touch the range meanwhile fault on the host although the
+// guest never lost those pages (RAGE's streamer writes into a page while another thread
+// re-commits it). The range is published here for the duration of the operation so the fault
+// handler can wait for it instead of reporting an unmapped access; see WaitForMappingTransition.
+struct MappingTransition {
+	uint64_t start = 0;
+	uint64_t size  = 0;
+	int      owner = 0;
+};
+
+static std::mutex                     g_transition_mutex;
+static std::condition_variable        g_transition_cv;
+static std::vector<MappingTransition> g_transitions;
+
+class MappingTransitionScope {
+public:
+	MappingTransitionScope(uint64_t start, uint64_t size) {
+		if (start == 0 || size == 0) {
+			return;
+		}
+		m_transition = {start, size, Common::Thread::GetThreadIdUnique()};
+		std::lock_guard lock(g_transition_mutex);
+		g_transitions.push_back(m_transition);
+	}
+
+	~MappingTransitionScope() {
+		if (m_transition.size == 0) {
+			return;
+		}
+		{
+			std::lock_guard lock(g_transition_mutex);
+			const auto      it = std::find_if(
+			    g_transitions.rbegin(), g_transitions.rend(), [this](const auto& transition) {
+				    return transition.start == m_transition.start &&
+				           transition.size == m_transition.size &&
+				           transition.owner == m_transition.owner;
+			    });
+			if (it != g_transitions.rend()) {
+				g_transitions.erase(std::next(it).base());
+			}
+		}
+		g_transition_cv.notify_all();
+	}
+
+	KYTY_CLASS_NO_COPY(MappingTransitionScope);
+
+private:
+	MappingTransition m_transition;
+};
 
 #include "memoryAddressSpace.inc"
 
@@ -417,6 +473,38 @@ public:
 
 		out->clear();
 		return false;
+	}
+
+	// Crash diagnostics: describe the range containing addr and its neighbours. Never blocks, so
+	// it is safe from a fault handler that may have interrupted a range operation.
+	bool TryDescribe(uint64_t addr, std::string* out) {
+		EXIT_IF(out == nullptr);
+		if (!m_mutex.TryLock()) {
+			return false;
+		}
+		auto describe = [out](const char* label, const Range& r) {
+			char line[256];
+			std::snprintf(line, sizeof(line),
+			              "  %s [0x%016" PRIx64 ", 0x%016" PRIx64 ") %s prot=0x%02x offset=0x%016" PRIx64
+			              " name=%.*s\n",
+			              label, r.start, End(r.start, r.size), Common::EnumName(r.type).c_str(),
+			              static_cast<unsigned>(r.protection), r.offset,
+			              static_cast<int>(KERNEL_MAXIMUM_NAME_LENGTH), r.name);
+			out->append(line);
+		};
+		auto next = std::upper_bound(
+		    m_ranges.begin(), m_ranges.end(), addr,
+		    [](uint64_t value, const Range& range) { return value < range.start; });
+		if (next != m_ranges.begin()) {
+			const auto& current = *std::prev(next);
+			describe(addr < End(current.start, current.size) ? "containing:" : "previous:  ",
+			         current);
+		}
+		if (next != m_ranges.end()) {
+			describe("next:      ", *next);
+		}
+		m_mutex.Unlock();
+		return true;
 	}
 
 	uint64_t ClampRangeSize(uint64_t virtual_addr, uint64_t size) {
@@ -818,6 +906,74 @@ static void                               MemoryPoolSubtractCommitted(uint64_t l
 // Keep host mappings, physical blocks, placeholders, and virtual ranges in step.
 static std::recursive_mutex g_memory_operation_mutex;
 
+// A short history of guest memory operations, printed with the guest fault context so a crash
+// log shows what last happened to the faulting page.
+enum class MemoryOpKind : uint8_t { MapDirect, Unmap, ReleaseDirect };
+
+struct RecentMemoryOp {
+	MemoryOpKind kind   = MemoryOpKind::MapDirect;
+	int          result = 0;
+	int          thread = 0;
+	uint64_t     vaddr  = 0;
+	uint64_t     size   = 0;
+	uint64_t     offset = 0;
+};
+
+static std::mutex                     g_recent_ops_mutex;
+static std::array<RecentMemoryOp, 64> g_recent_ops {};
+static uint64_t                       g_recent_ops_count = 0;
+
+static const char* MemoryOpKindName(MemoryOpKind kind) {
+	switch (kind) {
+		case MemoryOpKind::MapDirect: return "map-direct";
+		case MemoryOpKind::Unmap: return "unmap";
+		case MemoryOpKind::ReleaseDirect: return "release-direct";
+	}
+	return "?";
+}
+
+static void RecordMemoryOp(MemoryOpKind kind, uint64_t vaddr, uint64_t size, uint64_t offset,
+                           int result) {
+	std::lock_guard lock(g_recent_ops_mutex);
+	g_recent_ops[g_recent_ops_count % g_recent_ops.size()] = {
+	    kind, result, Common::Thread::GetThreadIdUnique(), vaddr, size, offset};
+	g_recent_ops_count++;
+}
+
+// Games rarely check these results; a failure usually surfaces later as a fault on a page the
+// game believes it owns, so make it visible on the console when it happens.
+static void WarnMemoryOpFailure(MemoryOpKind kind, uint64_t vaddr, uint64_t size, uint64_t offset,
+                                int result) {
+	static std::atomic<uint32_t> occurrences {0};
+	const auto                   occurrence = occurrences.fetch_add(1, std::memory_order_relaxed);
+	if (occurrence < 24 || occurrence % 1000 == 0) {
+		std::printf("Warning: guest memory operation failed: %s addr=0x%016" PRIx64
+		            " size=0x%016" PRIx64 " offset=0x%016" PRIx64 " result=0x%08x (occurrence %u)\n",
+		            MemoryOpKindName(kind), vaddr, size, offset, static_cast<uint32_t>(result),
+		            occurrence + 1);
+		std::fflush(stdout);
+	}
+	LOGF_COLOR(Log::Color::Red,
+	           "\t %s failed: addr=0x%016" PRIx64 " size=0x%016" PRIx64 " offset=0x%016" PRIx64
+	           " result=0x%08x\n",
+	           MemoryOpKindName(kind), vaddr, size, offset, static_cast<uint32_t>(result));
+}
+
+static void WarnBatchMapFailure(int index, int num_entries, const KernelBatchMapEntry& entry,
+                                int result) {
+	static std::atomic<uint32_t> occurrences {0};
+	const auto                   occurrence = occurrences.fetch_add(1, std::memory_order_relaxed);
+	if (occurrence < 24 || occurrence % 1000 == 0) {
+		std::printf("Warning: sceKernelBatchMap entry %d of %d failed (op=%d start=0x%016" PRIx64
+		            " offset=0x%016" PRIx64 " length=0x%016" PRIx64
+		            " prot=0x%02x): result=0x%08x; %d later entries were not applied\n",
+		            index, num_entries, entry.operation, reinterpret_cast<uint64_t>(entry.start),
+		            entry.offset, entry.length, static_cast<unsigned>(entry.protection),
+		            static_cast<uint32_t>(result), num_entries - index - 1);
+		std::fflush(stdout);
+	}
+}
+
 // The base address the PS5 kernel hands out for hint-less user mappings. Guest code can
 // assume mappings it did not place explicitly are at or above this (Sony's libc rejects a
 // heap below it), so hint-less searches must not fall back to the low system-managed range.
@@ -871,17 +1027,20 @@ bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
 		if (!Graphics::GuestGpu::IsGpuThread() ||
 		    GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size) ||
-		    GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size)) {
+		    GetGpuResources().GetTextureCache().QueryRegion(vaddr, size).gpu_image_bytes) {
 			return false;
 		}
 	}
 	return TryReadBacking(vaddr, data, size);
 }
 
+uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size) {
+	return g_virtual_ranges != nullptr ? g_virtual_ranges->ClampRangeSize(vaddr, size) : 0;
+}
+
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(g_virtual_ranges == nullptr);
-
-	const auto clamped_size = g_virtual_ranges->ClampRangeSize(vaddr, size);
+	const auto clamped_size = TryClampRangeSize(vaddr, size);
 	if (clamped_size == 0) {
 		EXIT("Memory: attempted to access invalid address 0x%016" PRIx64 " with size 0x%016" PRIx64
 		     "\n",
@@ -2545,7 +2704,7 @@ static int UnmapMemoryRange(uint64_t vaddr, size_t len) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI KernelMunmap(uint64_t vaddr, size_t len) {
+static int MunmapImpl(uint64_t vaddr, size_t len) {
 	PRINT_NAME();
 
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
@@ -2563,6 +2722,15 @@ int KYTY_SYSV_ABI KernelMunmap(uint64_t vaddr, size_t len) {
 	}
 	UnmapGpuRange(vaddr, len);
 	return UnmapMemoryRange(vaddr, len);
+}
+
+int KYTY_SYSV_ABI KernelMunmap(uint64_t vaddr, size_t len) {
+	const int result = MunmapImpl(vaddr, len);
+	RecordMemoryOp(MemoryOpKind::Unmap, vaddr, len, 0, result);
+	if (result != OK) {
+		WarnMemoryOpFailure(MemoryOpKind::Unmap, vaddr, len, 0, result);
+	}
+	return result;
 }
 
 size_t KYTY_SYSV_ABI KernelGetDirectMemorySize() {
@@ -2888,7 +3056,12 @@ int KYTY_SYSV_ABI KernelReleaseDirectMemory(int64_t start, size_t len) {
 		return validation;
 	}
 	if (len != 0) {
-		(void)ReleaseDirectMemoryInternal(start, len);
+		const int result = ReleaseDirectMemoryInternal(start, len);
+		RecordMemoryOp(MemoryOpKind::ReleaseDirect, 0, len, static_cast<uint64_t>(start), result);
+		if (result != OK) {
+			WarnMemoryOpFailure(MemoryOpKind::ReleaseDirect, 0, len, static_cast<uint64_t>(start),
+			                    result);
+		}
 	}
 	return OK;
 }
@@ -2909,8 +3082,19 @@ int KYTY_SYSV_ABI KernelCheckedReleaseDirectMemory(int64_t start, size_t len) {
 	return result == KERNEL_ERROR_EACCES ? KERNEL_ERROR_ENOENT : result;
 }
 
-int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int flags,
-                                        int64_t direct_memory_start, size_t alignment) {
+// True when [vaddr, vaddr + len) is already direct-mapped to exactly the physical pages a map
+// request names, piece by piece.
+static bool IsIdenticalDirectSpan(const std::vector<VirtualRanges::Range>& pieces, uint64_t vaddr,
+                                  uint64_t direct_memory_start) {
+	return !pieces.empty() &&
+	       std::all_of(pieces.begin(), pieces.end(), [vaddr, direct_memory_start](const auto& piece) {
+		       return piece.type == VirtualRangeType::Direct &&
+		              piece.offset == direct_memory_start + (piece.start - vaddr);
+	       });
+}
+
+static int MapDirectMemoryImpl(void** addr, size_t len, int prot, int flags,
+                               int64_t direct_memory_start, size_t alignment) {
 	PRINT_NAME();
 
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
@@ -2964,6 +3148,7 @@ int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int f
 		}
 	};
 
+	std::optional<MappingTransitionScope> transition;
 	if (fixed) {
 		if (in_addr == 0 || (in_addr & (PAGE_SIZE - 1u)) != 0 ||
 		    (alignment != 0 && in_addr % alignment != 0)) {
@@ -2972,6 +3157,31 @@ int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int f
 		if (no_overwrite && g_virtual_ranges->HasOverlap(in_addr, len)) {
 			return KERNEL_ERROR_ENOMEM;
 		}
+
+		// RAGE (GTA V) re-commits 64 KiB pages that are already committed at the same physical
+		// offset, sometimes while its streamer is still writing into them from another thread.
+		// Rebuilding an identical mapping would drain the GPU and leave a window in which those
+		// writes fault on an unmapped page; keep the live mapping and only refresh its protection.
+		if (std::vector<VirtualRanges::Range> live;
+		    g_virtual_ranges->QuerySpan(in_addr, len, &live) &&
+		    IsIdenticalDirectSpan(live, in_addr, static_cast<uint64_t>(direct_memory_start))) {
+			if (std::any_of(live.begin(), live.end(),
+			                [prot](const auto& piece) { return piece.protection != prot; })) {
+				const int protect_result =
+				    KernelMprotect(reinterpret_cast<const void*>(in_addr), len, prot);
+				if (protect_result != OK) {
+					return protect_result;
+				}
+			}
+			*addr = reinterpret_cast<void*>(in_addr);
+			LOGF("\t identical direct mapping kept: addr=0x%016" PRIx64 " dmem=0x%016" PRIx64
+			     " size=0x%016" PRIx64 "\n",
+			     in_addr, static_cast<uint64_t>(direct_memory_start), static_cast<uint64_t>(len));
+			return OK;
+		}
+
+		// Anything already mapped here is torn down before the new view is created.
+		transition.emplace(in_addr, len);
 
 		std::vector<VirtualRanges::Range> reserved_ranges;
 		if (g_virtual_ranges->QuerySpan(in_addr, len, &reserved_ranges) &&
@@ -3085,6 +3295,21 @@ int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int f
 	LOGF_COLOR(Log::Color::Green, "\t [Ok]\n");
 
 	return OK;
+}
+
+int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int flags,
+                                        int64_t direct_memory_start, size_t alignment) {
+	const auto requested = (addr != nullptr ? reinterpret_cast<uint64_t>(*addr) : 0);
+	const int  result = MapDirectMemoryImpl(addr, len, prot, flags, direct_memory_start, alignment);
+	const auto mapped =
+	    (result == OK && addr != nullptr ? reinterpret_cast<uint64_t>(*addr) : requested);
+	RecordMemoryOp(MemoryOpKind::MapDirect, mapped, len, static_cast<uint64_t>(direct_memory_start),
+	               result);
+	if (result != OK) {
+		WarnMemoryOpFailure(MemoryOpKind::MapDirect, requested, len,
+		                    static_cast<uint64_t>(direct_memory_start), result);
+	}
+	return result;
 }
 
 int KYTY_SYSV_ABI KernelMapDirectMemory2(void** addr, size_t len, int type, int prot, int flags,
@@ -3855,6 +4080,7 @@ int KYTY_SYSV_ABI KernelBatchMap2(KernelBatchMapEntry* entries, int num_entries,
 		}
 
 		if (result != OK) {
+			WarnBatchMapFailure(i, num_entries, *entry, result);
 			if (num_entries_out != nullptr) {
 				*num_entries_out = processed;
 			}
@@ -4242,6 +4468,107 @@ int KYTY_SYSV_ABI KernelMemoryPoolGetBlockStats(KernelMemoryPoolBlockStats* outp
 	}
 
 	return OK;
+}
+
+bool WaitForMappingTransition(uint64_t vaddr) noexcept {
+	const int self    = Common::Thread::GetThreadIdUnique();
+	auto      covered = [vaddr, self]() {
+		return std::any_of(g_transitions.begin(), g_transitions.end(),
+		                   [vaddr, self](const auto& transition) {
+			                   return transition.owner != self && vaddr >= transition.start &&
+			                          vaddr - transition.start < transition.size;
+		                   });
+	};
+	std::unique_lock lock(g_transition_mutex);
+	if (!covered()) {
+		return false;
+	}
+	// Bounded, so an operation that never completes still ends in a diagnosable crash.
+	const bool finished =
+	    g_transition_cv.wait_for(lock, std::chrono::seconds(30), [&covered]() { return !covered(); });
+	if (!finished) {
+		std::printf("Warning: the memory operation rebuilding the mapping at 0x%016" PRIx64
+		            " did not finish within 30 s\n",
+		            vaddr);
+		std::fflush(stdout);
+	}
+	return finished;
+}
+
+void DumpGuestMemoryState(uint64_t vaddr) noexcept {
+	constexpr uint64_t GuestPageSize = 0x4000;
+	constexpr uint64_t BlockSize     = 0x10000;
+	std::printf("--- Guest memory state at 0x%016" PRIx64 " ---\n", vaddr);
+	{
+		std::lock_guard lock(g_transition_mutex);
+		for (const auto& transition: g_transitions) {
+			const bool covers =
+			    vaddr >= transition.start && vaddr - transition.start < transition.size;
+			std::printf("  mapping transition in progress: [0x%016" PRIx64 ", 0x%016" PRIx64
+			            ") owner thread %d%s\n",
+			            transition.start, transition.start + transition.size, transition.owner,
+			            covers ? " (covers the fault)" : "");
+		}
+	}
+	// Serialize with memory operations, but never hang the crash path behind one that is stuck.
+	bool locked = false;
+	for (int attempt = 0; attempt < 200 && !locked; attempt++) {
+		locked = g_memory_operation_mutex.try_lock();
+		if (!locked) {
+			Common::Thread::SleepMicro(10000);
+		}
+	}
+	std::printf("  memory operation lock: %s\n",
+	            locked ? "idle" : "held by another thread (an operation is in progress)");
+	if (g_virtual_ranges != nullptr) {
+		std::string text;
+		if (g_virtual_ranges->TryDescribe(vaddr, &text)) {
+			std::printf("  guest virtual ranges:\n%s", text.c_str());
+		} else {
+			std::printf("  guest virtual ranges: busy\n");
+		}
+	}
+	if (g_gpu_resources != nullptr) {
+		std::printf("  GPU tracker: page %s\n",
+		            g_gpu_resources->IsMapped(vaddr & ~(GuestPageSize - 1u), 1) ? "mapped"
+		                                                                        : "not mapped");
+	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	MEMORY_BASIC_INFORMATION info {};
+	if (VirtualQuery(reinterpret_cast<const void*>(vaddr), &info, sizeof(info)) != 0) {
+		const char* state = info.State == MEM_COMMIT    ? "committed"
+		                    : info.State == MEM_RESERVE ? "reserved (placeholder, no view mapped)"
+		                    : info.State == MEM_FREE    ? "free"
+		                                                : "?";
+		std::printf("  host page: base=0x%016" PRIx64 " size=0x%016" PRIx64
+		            " state=%s protect=0x%08x\n",
+		            reinterpret_cast<uint64_t>(info.BaseAddress),
+		            static_cast<uint64_t>(info.RegionSize), state,
+		            static_cast<uint32_t>(info.Protect));
+	}
+#endif
+	if (locked) {
+		g_memory_operation_mutex.unlock();
+	}
+	{
+		std::lock_guard lock(g_recent_ops_mutex);
+		const auto      block = vaddr & ~(BlockSize - 1u);
+		const auto      count = std::min<uint64_t>(g_recent_ops_count, g_recent_ops.size());
+		std::printf("  recent memory operations (%" PRIu64 " total, * touches the faulting 64 KiB "
+		            "block):\n",
+		            g_recent_ops_count);
+		for (uint64_t i = 0; i < count; i++) {
+			const auto  index   = g_recent_ops_count - count + i;
+			const auto& op      = g_recent_ops[index % g_recent_ops.size()];
+			const bool  touches = op.vaddr != 0 && op.vaddr < block + BlockSize &&
+			                     op.vaddr + op.size > block;
+			std::printf("  %s#%" PRIu64 " %-14s thread=%d addr=0x%016" PRIx64 " size=0x%016" PRIx64
+			            " offset=0x%016" PRIx64 " result=0x%08x\n",
+			            touches ? "*" : " ", index, MemoryOpKindName(op.kind), op.thread, op.vaddr,
+			            op.size, op.offset, static_cast<uint32_t>(op.result));
+		}
+	}
+	std::fflush(stdout);
 }
 
 } // namespace Libs::LibKernel::Memory

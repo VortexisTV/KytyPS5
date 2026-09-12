@@ -809,7 +809,7 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 
 		VblankBegin();
 		bool presented = m_flip_queue.Flip(0);
-		if (!presented && m_presenter.NeedsSystemOverlayRefresh()) {
+		if (!presented && m_presenter.NeedsImeRefresh()) {
 			if (auto* frame = m_presenter.PrepareLastFrame(); frame != nullptr) {
 				m_presenter.Present(*frame, true);
 				presented = true;
@@ -1123,6 +1123,8 @@ bool FlipQueue::Flip(uint32_t micros) {
 	m_mutex.Unlock();
 
 	m_presenter.Present(*r.frame);
+	KYTY_PROFILER_FRAME_MARK;
+	Graphics::RenderDocOnGuestFlip();
 
 	m_mutex.Lock();
 	if (m_requests.empty() || m_requests.front().id != r.id ||
@@ -1148,8 +1150,6 @@ bool FlipQueue::Flip(uint32_t micros) {
 	m_submit_slot_cond_var.Signal();
 	m_mutex.Unlock();
 	r.cfg->mutex.Unlock();
-
-	Graphics::RenderDocOnGuestFlip(m_presenter.Renderer());
 
 	if (Config::GraphicsDebugDumpEnabled() &&
 	    Config::GetPrintfDirection() != Config::OutputDirection::Silent) {

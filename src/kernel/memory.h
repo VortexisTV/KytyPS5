@@ -111,11 +111,19 @@ bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadPrtBacking(uint64_t vaddr, void* data, uint64_t size);
+[[nodiscard]] uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::GpuResourceManager* resources) noexcept;
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+// A host fault on a range whose mapping another thread is rebuilding right now (a fixed map over
+// a live mapping, or a partial unmap of a host view) waits for that operation to finish. Returns
+// true when the faulting access should simply be retried.
+[[nodiscard]] bool WaitForMappingTransition(uint64_t vaddr) noexcept;
+// Crash diagnostics: print the guest and host state of the page at vaddr and the most recent
+// memory operations.
+void DumpGuestMemoryState(uint64_t vaddr) noexcept;
 
 int KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,
                                                const char* name);

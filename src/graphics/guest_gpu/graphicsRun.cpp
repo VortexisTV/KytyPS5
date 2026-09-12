@@ -6,6 +6,7 @@
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "common/timer.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
@@ -13,6 +14,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
+#include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
 #include "graphics/shader/shader.h"
@@ -265,7 +267,23 @@ void CommandProcessor::BufferInit() {
 }
 
 void CommandProcessor::BufferFlush() {
+	m_last_flush_qpc = Common::Timer::QueryPerformanceCounter();
+	if (GetScheduler().Active()) {
+		m_renderer.GetGpuResources().GetBufferCache().RecordHotShadows();
+	}
 	GetScheduler().Flush();
+}
+
+void CommandProcessor::RequestBufferFlush() {
+	// UE4 titles emit an end-of-pipe fence after almost every pass; submitting a command buffer
+	// for each one produced ~170 vkQueueSubmit calls per frame of a few draws each. One submit
+	// per millisecond keeps fence latency bounded while batching the work.
+	static const uint64_t min_interval = Common::Timer::QueryPerformanceFrequency() / 1000;
+	const auto            now          = Common::Timer::QueryPerformanceCounter();
+	if (m_last_flush_qpc != 0 && now - m_last_flush_qpc < min_interval) {
+		return;
+	}
+	BufferFlush();
 }
 
 void CommandProcessor::BufferFlushAndWait() {
@@ -560,6 +578,10 @@ void GuestGpu::ThreadRun(void* data) {
 
 bool GuestGpu::Process(Submission& submission) {
 	const bool first_slice = !submission.started;
+	if (first_slice && RenderDocCaptureRequested()) {
+		Common::LockGuard render_lock(m_renderer.GetMutex());
+		RenderDocStartCapture();
+	}
 	auto& cp = GetProcessor(submission.queue_id);
 
 	if (first_slice && submission.reset_processor) {
@@ -825,10 +847,6 @@ void CommandProcessor::SetNumInstances(uint32_t num_instances) {
 
 void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t wait_op,
                                       const volatile void* address, uint32_t count_in_dwords) {
-	if (wait_op != 0) {
-		BufferFlushAndWait();
-	}
-
 	(void)count_in_dwords;
 
 	switch (op) {
@@ -837,6 +855,14 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 		} break;
 		case 0x03: {
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
+			const auto predicate_address = reinterpret_cast<uint64_t>(address);
+			auto&      buffer_cache      = m_renderer.GetBufferCache();
+			const bool predicate_gpu_dirty =
+			    buffer_cache.HasGpuDirtyBytes(predicate_address, sizeof(uint64_t)) ||
+			    buffer_cache.IsRegionGpuModified(predicate_address, sizeof(uint64_t));
+			if (wait_op != 0 && predicate_gpu_dirty) {
+				BufferFlushAndWait();
+			}
 
 			auto value = *reinterpret_cast<const volatile uint64_t*>(address);
 
@@ -1481,37 +1507,41 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 		case 0x00000019:
 		case 0x0000001a:
 		case 0x0000001b:
-		case 0x00000038:
-		case 0x0000003a:
 			LOGF("\t temporary: ignoring unsupported event_write type 0x%08" PRIx32
 			     ", index 0x%08" PRIx32 "\n",
 			     event_type, event_index);
 			break;
+		case 0x00000038: // PIXEL_PIPE_STAT_CONTROL
+			break;
 		case 0x00000039: {
-			if (event_index != 0x00000001 || event_address == 0 || (event_address & 0x7u) != 0) {
-				EXIT("invalid occlusion-counter dump: index=0x%08" PRIx32 ", address=0x%016" PRIx64
-				     "\n",
-				     event_index, event_address);
-			}
 			static std::once_flag warning_once;
 			std::call_once(warning_once, [] {
 				std::printf("Warning: game uses occlusion queries, which are currently treated as "
 				            "always visible; GPU usage may be higher and FPS may be lower.\n");
 			});
 
-			// Until host occlusion queries are implemented, publish an always-visible result. The
-			// PS5 layout contains one interleaved begin/end pair per DB, and bit 63 marks a result
-			// ready.
-			constexpr uint64_t ready_bit    = 1ull << 63u;
-			constexpr uint64_t counter_mask = ready_bit - 1u;
-			auto*              results      = reinterpret_cast<volatile uint64_t*>(event_address);
-			const auto         value        = ready_bit | m_synthetic_occlusion_counter;
-			for (uint32_t db = 0; db < 16u; db++) {
-				results[db * 2u] = value;
+			if (event_index != 0x00000001 || event_address == 0 || (event_address & 0x7u) != 0) {
+				EXIT("invalid occlusion-counter dump: index=0x%08" PRIx32
+				     ", address=0x%016" PRIx64 "\n",
+				     event_index, event_address);
 			}
-			m_synthetic_occlusion_counter = (m_synthetic_occlusion_counter + 1u) & counter_mask;
+
+			// Deriving the synthetic counter from the slot keeps each begin/end pair stable across
+			// asynchronous reads. Keep a sizeable distance between adjacent slots instead of reporting
+			// exactly one sample: one was enough for the first visibility path found in this title, but
+			// it is not an honest "always visible" result for callers that apply a minimum-sample
+			// threshold. Event addresses are 48-bit and 8-byte aligned, so shifting their slot index by
+			// 18 remains below the ready bit without wrapping. A conventional adjacent begin/end pair
+			// therefore reports 262144 visible samples while retaining the address-only, frame-stable
+			// property that removed the original model flicker.
+			constexpr uint64_t ready_bit      = 1ull << 63u;
+			constexpr uint64_t visible_stride = 1ull << 18u;
+			auto*              result         = reinterpret_cast<volatile uint64_t*>(event_address);
+			*result = ready_bit | ((event_address >> 3u) * visible_stride);
 			break;
 		}
+		case 0x0000003a: // PIXEL_PIPE_STAT_RESET
+			break;
 		default:
 			EXIT("unknown event type: 0x%08" PRIx32 ", 0x%08" PRIx32 "\n", event_type, event_index);
 	}

@@ -9,6 +9,8 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/shader.h"
 
+#include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <deque>
@@ -16,12 +18,15 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
+#include <string>
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <xxhash.h>
 
 namespace Libs::Graphics {
 
@@ -29,35 +34,41 @@ struct GraphicContext;
 struct RenderColorInfo;
 struct RenderDepthInfo;
 class CommandBuffer;
+class GraphicsPipelineLibraryCache;
 
 namespace HW {
 class Context;
 class Shader;
-class UserConfig;
 struct ComputeShaderInfo;
 } // namespace HW
 
 #pragma pack(push, 1)
 
 struct PipelineStaticParameters {
+	float                      viewport_scale[3]        = {};
+	float                      viewport_offset[3]       = {};
 	bool                       negative_one_to_one      = false;
 	bool                       depth_clip_enable        = true;
+	int                        scissor_ltrb[4]          = {0};
 	vk::PrimitiveTopology      topology                 = vk::PrimitiveTopology::ePointList;
 	bool                       primitive_restart_enable = false;
 	uint32_t                   samples                  = 1;
 	bool                       sample_shading_enable    = false;
+	bool                       with_depth               = false;
+	bool                       depth_test_enable        = false;
+	bool                       depth_write_enable       = false;
+	vk::CompareOp              depth_compare_op         = vk::CompareOp::eNever;
 	bool                       depth_bounds_test_enable = false;
 	float                      depth_min_bounds         = 0.0f;
 	float                      depth_max_bounds         = 0.0f;
 	bool                       stencil_test_enable      = false;
 	PipelineStencilStaticState stencil_front;
 	PipelineStencilStaticState stencil_back;
+	uint32_t                   color_count                                        = 1;
 	uint32_t                   color_mask[RENDER_COLOR_ATTACHMENTS_MAX]           = {};
 	bool                       cull_front                                         = false;
 	bool                       cull_back                                          = false;
 	bool                       face                                               = false;
-	bool                       provoking_vtx_last                                 = false;
-	vk::PolygonMode            polygon_mode                                       = vk::PolygonMode::eFill;
 	uint8_t                    color_srcblend[RENDER_COLOR_ATTACHMENTS_MAX]       = {};
 	uint8_t                    color_comb_fcn[RENDER_COLOR_ATTACHMENTS_MAX]       = {};
 	uint8_t                    color_destblend[RENDER_COLOR_ATTACHMENTS_MAX]      = {};
@@ -76,7 +87,14 @@ struct PipelineStaticParameters {
 static_assert(std::is_trivially_copyable_v<PipelineStaticParameters>);
 static_assert(std::is_standard_layout_v<PipelineStaticParameters>);
 static_assert(alignof(PipelineStaticParameters) == 1);
-static_assert(sizeof(PipelineStaticParameters) == 166);
+static_assert(sizeof(PipelineStaticParameters) ==
+              sizeof(float[3]) + sizeof(float[3]) + sizeof(bool) * 2 + sizeof(int[4]) +
+                  sizeof(vk::PrimitiveTopology) + sizeof(bool) + sizeof(uint32_t) +
+                  sizeof(bool) * 4 + sizeof(vk::CompareOp) + sizeof(bool) + sizeof(float) * 2 +
+                  sizeof(bool) + sizeof(PipelineStencilStaticState) * 2 + sizeof(uint32_t) +
+                  sizeof(uint32_t[RENDER_COLOR_ATTACHMENTS_MAX]) + sizeof(bool) * 3 +
+                  sizeof(uint8_t[RENDER_COLOR_ATTACHMENTS_MAX]) * 6 +
+                  sizeof(bool[RENDER_COLOR_ATTACHMENTS_MAX]) * 3);
 
 struct PipelineRenderingState {
 	std::array<vk::Format, RENDER_COLOR_ATTACHMENTS_MAX> color_formats {};
@@ -119,13 +137,30 @@ public:
 	explicit PipelineCache(GraphicContext& graphics);
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
+	// Final save at shutdown: writes the driver cache and releases it.
 	void Save();
+	// Write the driver cache to disk when pipelines were added since the last write. Safe from
+	// any thread while the cache stays in use; the background saver calls it periodically.
+	void SaveSnapshot();
+	// Best-effort save from a thread that is about to terminate the process on a fault: bounded
+	// in time and never blocks on the crashing thread's own state.
+	void EmergencySave() noexcept;
 
 	struct Pipeline {
 		vk::PipelineLayout      pipeline_layout       = nullptr;
 		vk::Pipeline            pipeline              = nullptr;
 		vk::DescriptorSetLayout descriptor_set_layout = nullptr;
 		bool                    uses_push_descriptors = false;
+		bool                    owns_layout           = true;
+	};
+
+	struct GraphicsPipeline: Pipeline {
+		uint64_t vs_shader_id = 0;
+		uint64_t ps_shader_id = 0;
+	};
+
+	struct ComputePipeline: Pipeline {
+		uint64_t cs_shader_id = 0;
 	};
 
 	struct GraphicsPrograms {
@@ -133,27 +168,28 @@ public:
 		ShaderProgram pixel;
 	};
 
-	GraphicsPrograms
-	GetGraphicsPrograms(const HW::VertexShaderInfo& vertex_regs,
-	                    const HW::PixelShaderInfo& pixel_regs, const HW::ShaderRegisters& sh,
-	                    const HW::Context& context, const HW::UserConfig& user_config,
-	                    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
-	                    bool pixel_active, ShaderVertexInputInfo& vertex_info,
-	                    ShaderPixelInputInfo& pixel_info);
+	GraphicsPrograms GetGraphicsPrograms(
+	    const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
+	    const HW::ShaderRegisters& sh, const HW::Context& context,
+	    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
+	    bool pixel_active, ShaderVertexInputInfo& vertex_info, ShaderPixelInputInfo& pixel_info);
 	ShaderProgram GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                const HW::ShaderRegisters&   sh,
 	                                ShaderComputeInputInfo&      input_info);
 
-	// Returns null while asynchronous shader or pipeline construction is still in progress. The
-	// caller should skip the draw and retry when the guest submits it again.
-	Pipeline*
+	// Returns null while the pipeline is still being built on a worker thread (async mode); the
+	// caller skips the draw and retries on a later frame.
+	GraphicsPipeline*
 	CreateGraphicsPipeline(std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
 	                       const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
 	                       const ShaderPixelInputInfo* ps_input_info,
 	                       vk::PrimitiveTopology topology, bool primitive_restart_enable,
 	                       const ShaderProgram& vertex_program, const ShaderProgram& pixel_program);
-	Pipeline& CreateComputePipeline(const ShaderComputeInputInfo& input_info,
-	                                const ShaderProgram&          compute_program);
+	ComputePipeline& CreateComputePipeline(ShaderComputeInputInfo& input_info,
+	                                       const ShaderProgram&    compute_program);
+	// The vertex-layout part of a graphics pipeline key, derived from the bound vertex buffers.
+	[[nodiscard]] static PipelineVertexInputState
+	BuildVertexInputState(const ShaderVertexInputInfo& vs_input_info);
 
 private:
 	struct ProgramCache;
@@ -172,6 +208,14 @@ private:
 		}
 	};
 
+	struct ComputePipelineKey {
+		uint64_t cs_shader_id = 0;
+
+		bool operator==(const ComputePipelineKey& other) const {
+			return cs_shader_id == other.cs_shader_id;
+		}
+	};
+
 	struct PipelineKeyHash {
 		static void Mix(std::size_t& hash, std::size_t value) {
 			hash ^= value + static_cast<std::size_t>(0x9e3779b97f4a7c15ull) + (hash << 6u) +
@@ -179,10 +223,9 @@ private:
 		}
 
 		static void MixStaticParams(std::size_t& hash, const PipelineStaticParameters& params) {
-			const auto* bytes = reinterpret_cast<const uint8_t*>(&params);
-			for (std::size_t i = 0; i < sizeof(params); i++) {
-				Mix(hash, bytes[i]);
-			}
+			// The struct is packed with no padding, so hashing its bytes in one pass is exact;
+			// this runs once per draw.
+			Mix(hash, static_cast<std::size_t>(XXH3_64bits(&params, sizeof(params))));
 		}
 
 		static void MixRendering(std::size_t& hash, const PipelineRenderingState& rendering) {
@@ -216,18 +259,34 @@ private:
 		}
 	};
 
+	struct ComputePipelineKeyHash {
+		std::size_t operator()(const ComputePipelineKey& key) const {
+			std::size_t hash = 0;
+			PipelineKeyHash::Mix(hash, key.cs_shader_id);
+			return hash;
+		}
+	};
+
 	GraphicContext&               m_graphics;
+	GraphicsPipelineKey           m_last_graphics_key {};
+	GraphicsPipeline*             m_last_graphics_pipeline = nullptr;
 	std::unique_ptr<ProgramCache> m_program_cache;
+	std::unique_ptr<GraphicsPipelineLibraryCache> m_graphics_library_cache;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
-	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
-	                                                        m_graphics_pipelines;
-	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
+	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>,
+	                   GraphicsPipelineKeyHash>
+	    m_graphics_pipelines;
+	std::unordered_map<ComputePipelineKey, std::unique_ptr<ComputePipeline>, ComputePipelineKeyHash>
+	              m_compute_pipelines;
 	Common::Mutex m_mutex;
 
+	// Asynchronous graphics pipeline construction. Keys being built live in m_pending_pipelines
+	// (GPU thread only); finished pipelines wait in m_completed_pipelines until the GPU thread
+	// drains them at its next lookup.
 	struct CompletedPipeline {
-		GraphicsPipelineKey       key;
-		std::unique_ptr<Pipeline> pipeline;
+		GraphicsPipelineKey               key;
+		std::unique_ptr<GraphicsPipeline> pipeline;
 	};
 	std::unordered_set<GraphicsPipelineKey, GraphicsPipelineKeyHash> m_pending_pipelines;
 	std::mutex                                                       m_completed_mutex;
@@ -239,21 +298,56 @@ private:
 	bool                                                             m_stop_workers = false;
 	bool                                                             m_async        = false;
 
+	// Periodic and emergency saves of the driver cache. m_pipelines_created counts pipelines that
+	// were really built (and therefore added to the driver cache); a save is only worth it when
+	// it moved past m_pipelines_saved.
+	std::mutex              m_save_mutex;
+	std::atomic<uint64_t>   m_pipelines_created {0};
+	uint64_t                m_pipelines_saved = 0; // guarded by m_save_mutex
+	std::jthread            m_saver;
+	std::mutex              m_saver_mutex;
+	std::condition_variable m_saver_wake;
+	bool                    m_stop_saver = false; // guarded by m_saver_mutex
+
 	void InitializeDriverCache();
+	bool WriteDriverCache();
+	void StartSaver();
+	void StopSaver();
 	void StartWorkers();
 	void StopWorkers();
 	void EnqueueJob(std::function<void()> job);
 	void DrainCompletedPipelines();
 };
 
+class GraphicsPipelineLibraryCache {
+public:
+	GraphicsPipelineLibraryCache(GraphicContext& graphics, vk::PipelineCache driver_cache);
+	~GraphicsPipelineLibraryCache();
+	KYTY_CLASS_NO_COPY(GraphicsPipelineLibraryCache);
+
+	void PrepareLayout(PipelineCache::GraphicsPipeline&                pipeline,
+	                   std::span<const vk::DescriptorSetLayoutBinding> bindings);
+	bool CreatePipeline(PipelineCache::GraphicsPipeline&         pipeline,
+	                    const PipelineRenderingState&            rendering,
+	                    const PipelineStaticParameters&          static_params,
+	                    const vk::GraphicsPipelineCreateInfo&    pipeline_info,
+	                    uint32_t                                 pre_raster_stage_count,
+	                    const vk::PipelineShaderStageCreateInfo* fragment_stage);
+
+private:
+	struct Impl;
+	std::unique_ptr<Impl> m_impl;
+};
+
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
 void CreatePipelineInternal(
-    GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+    GraphicContext& graphics, PipelineCache::GraphicsPipeline& pipeline,
     const PipelineRenderingState& rendering, const PipelineVertexInputState& vertex_input,
-    const ShaderVertexInputInfo& vs_input_info, const ShaderProgram& vertex_program,
-    const ShaderPixelInputInfo* ps_input_info, const ShaderProgram& pixel_program,
-    const PipelineStaticParameters& static_params, vk::PipelineCache driver_cache);
-void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+    const ShaderVertexInputInfo& vs_input_info, vk::ShaderModule vertex_module,
+    const ShaderPixelInputInfo* ps_input_info, vk::ShaderModule pixel_module,
+    const PipelineStaticParameters& static_params,
+    vk::PipelineCache driver_cache, GraphicsPipelineLibraryCache* library_cache);
+void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::ComputePipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
                             vk::ShaderModule compute_module, vk::PipelineCache driver_cache);
 

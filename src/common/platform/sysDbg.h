@@ -30,6 +30,8 @@ struct sys_dbg_stack_info_t {
 #endif
 };
 
-void SysStackUsage(sys_dbg_stack_info_t& s); // NOLINT(google-runtime-references)
+void SysStackWalk(void** stack, int* depth);
+void SysStackUsage(sys_dbg_stack_info_t& s);          // NOLINT(google-runtime-references)
+void SysStackUsagePrint(sys_dbg_stack_info_t& stack); // NOLINT(google-runtime-references)
 
 #endif /* KYTY_COMMON_PLATFORM_SYSDBG_H_ */

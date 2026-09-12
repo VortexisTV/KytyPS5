@@ -10,6 +10,7 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 class Value;
 
 using SrtMemoryReader = bool (*)(void* userdata, uint64_t address, uint32_t* value);
+using SrtMemoryRangeValidator = bool (*)(void* userdata, uint64_t address, uint64_t size);
 
 struct SrtRuntime {
 	std::span<const uint32_t> user_data;
@@ -17,17 +18,13 @@ struct SrtRuntime {
 	SrtMemoryReader           read_memory                = nullptr;
 	void*                     userdata                   = nullptr;
 	SrtMemoryReader           read_specialization_memory = nullptr;
+	SrtMemoryRangeValidator   validate_memory_range       = nullptr;
 };
-
-enum class RuntimeValueType { Any, Integer };
 
 // Collects reachable ReadConst values. Immediate offsets receive compact flat-buffer slots;
 // dynamic offsets remain explicit and are never assigned a fake slot.
 void BuildSrtPlan(Program& program);
-bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
-                          RuntimeValueType type = RuntimeValueType::Any);
-bool EvaluateUniformValues(const ResourcePlan& program, std::span<const Value> values,
-                            const SrtRuntime& runtime, std::span<uint32_t> results);
+bool ValidateRuntimeValue(const ResourcePlan& program, Value value);
 
 bool EvaluateDescriptorSource(const ResourcePlan& program, uint32_t source,
                               const SrtRuntime& runtime, DescriptorValue& result);
@@ -37,12 +34,11 @@ bool EvaluateDescriptorSource(const ResourcePlan& program, uint32_t source,
 bool EvaluateDescriptorSources(const ResourcePlan& program, std::span<const uint32_t> sources,
                                const SrtRuntime& runtime, std::vector<DescriptorValue>& results);
 
-// Evaluates potentially reachable descriptor sources and the flattened immediate SRT with one
-// memoized scalar walk. Inactive descriptors are zero; on failure no destination is changed.
+// Evaluates descriptor sources and the flattened immediate SRT with one memoized scalar walk.
+// On failure neither destination is changed.
 bool EvaluateRuntimeSources(const ResourcePlan& program, std::span<const uint32_t> sources,
                             const SrtRuntime& runtime, std::vector<DescriptorValue>& results,
-                            std::vector<uint32_t>& flat, std::span<const uint8_t> clean_flat_slots,
-                            std::vector<uint8_t>& active_sources);
+                            std::vector<uint32_t>& flat, std::span<const uint8_t> clean_flat_slots);
 
 bool WalkSrt(const ResourcePlan& program, const SrtRuntime& runtime,
              std::vector<uint32_t>& flat);

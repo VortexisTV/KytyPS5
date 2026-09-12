@@ -160,9 +160,6 @@ enum class StageInputKind {
 	InstanceIndex,
 	FragCoord,
 	FrontFacing,
-	PackedAncillary,
-	Layer,
-	SampleId,
 	BaryCoordSmooth,
 	BaryCoordNoPerspective,
 	WorkgroupId,
@@ -181,8 +178,7 @@ enum class StageOutputKind {
 	PointSize,
 	ClipDistance,
 	CullDistance,
-	Layer,
-	ViewportIndex
+	Layer
 };
 
 struct PositionExportComponent {
@@ -255,10 +251,9 @@ struct StageOutput {
 	bool operator==(const StageOutput& other) const = default;
 };
 
-inline constexpr uint32_t FirstImageBinding           = 1u;
-inline constexpr uint32_t FirstComparisonImageBinding = 22u;
-inline constexpr uint32_t FirstStorageImageBinding    = 29u;
-inline constexpr uint32_t ImageBindingCount           = 43u;
+inline constexpr uint32_t FirstImageBinding        = 1u;
+inline constexpr uint32_t FirstStorageImageBinding = 22u;
+inline constexpr uint32_t ImageBindingCount        = 36u;
 
 enum class DescriptorBindingKind : uint32_t {
 	Buffers  = 0u,
@@ -271,12 +266,11 @@ enum class DescriptorBindingKind : uint32_t {
 	Count,
 };
 
-static_assert(static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 44u);
-static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 50u);
+static_assert(static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 37u);
+static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 43u);
 
 struct PushData {
 	static constexpr uint32_t DwordCount = 32;
-	static constexpr uint32_t MeshDrawDwordCount = 6;
 	static constexpr uint32_t NoStart    = UINT32_MAX;
 	std::array<uint32_t, DwordCount> dwords {};
 
@@ -317,9 +311,9 @@ DescriptorBindingForImage(const ImageResource& image) {
 	constexpr uint32_t SampledFloatBinding = 1u;
 	constexpr uint32_t SampledUintBinding  = 8u;
 	constexpr uint32_t SampledSintBinding  = 15u;
-	constexpr uint32_t StorageFloatBinding = FirstStorageImageBinding;
-	constexpr uint32_t StorageUintBinding  = StorageFloatBinding + 5u;
-	constexpr uint32_t AtomicUintBinding   = StorageUintBinding + 5u;
+	constexpr uint32_t StorageFloatBinding = 22u;
+	constexpr uint32_t StorageUintBinding  = 27u;
+	constexpr uint32_t AtomicUintBinding   = 32u;
 
 	uint32_t base    = 0;
 	bool     sampled = false;
@@ -329,16 +323,11 @@ DescriptorBindingForImage(const ImageResource& image) {
 		}
 		sampled = true;
 		switch (image.numeric_class) {
-			case Prospero::TextureNumericClass::Float:
-				base = image.depth_compare ? FirstComparisonImageBinding : SampledFloatBinding;
-				break;
+			case Prospero::TextureNumericClass::Float: base = SampledFloatBinding; break;
 			case Prospero::TextureNumericClass::Uint: base = SampledUintBinding; break;
 			case Prospero::TextureNumericClass::Sint: base = SampledSintBinding; break;
 			case Prospero::TextureNumericClass::Unsupported: return std::nullopt;
 			default: return std::nullopt;
-		}
-		if (image.depth_compare && image.numeric_class != Prospero::TextureNumericClass::Float) {
-			return std::nullopt;
 		}
 	} else if (image.resource_class == ImageResourceClass::Storage) {
 		if (image.atomic) {
@@ -415,7 +404,7 @@ struct BindingLayout {
 
 struct ShaderInfo {
 	static constexpr uint32_t MaxBuffers      = 32;
-	static constexpr uint32_t MaxImages       = 64;
+	static constexpr uint32_t MaxImages       = 32;
 	static constexpr uint32_t MaxSamplers     = 32;
 	static constexpr uint32_t MaxSampledPairs = 64;
 
@@ -480,13 +469,6 @@ struct SrtRead {
 	bool operator==(const SrtRead& other) const = default;
 };
 
-struct ResourceBlock {
-	// Conditional successors are ordered true, false; an empty condition follows every edge.
-	Value                 condition;
-	std::vector<uint32_t> successors;
-	std::vector<uint32_t> sources;
-};
-
 // Stable shader metadata consumed by the renderer after native IR has been discarded.
 struct CompiledShaderInfo {
 	ShaderType                    stage               = ShaderType::Unknown;
@@ -500,13 +482,10 @@ struct CompiledShaderInfo {
 	BindingLayout                 bindings;
 };
 
-struct UniformFillPlan {
-	UniformFill          fill;
-	std::array<Value, 4> values;
-};
+struct CompiledSrt;
 
-// Immutable runtime resource analysis retained by the shader cache. It owns descriptor/SRT,
-// uniform condition and fill values without retaining translated blocks.
+// Immutable runtime resource analysis retained by the shader cache. It owns only the native
+// value graph reachable from descriptors/SRT reads, rather than the translated shader CFG.
 struct ResourcePlan {
 	ResourcePlan() = default;
 	~ResourcePlan();
@@ -523,15 +502,20 @@ struct ResourcePlan {
 	std::list<Inst>                     value_storage;
 	std::vector<MemoryInfo>             memory_info;
 	std::vector<DescriptorSource>       descriptor_sources;
-	std::vector<ResourceBlock>          control_flow;
 	std::vector<uint32_t>               materialization_sources;
 	std::vector<SrtRead>                srt_reads;
 	std::vector<uint8_t>                clean_flat_slots;
+	// Number of values carrying an eval slot (see Inst::GetEvalSlot); 0 when not numbered.
+	uint32_t                            eval_slot_count                = 0;
+	// Lazily built flat evaluation program (SrtWalker.cpp). Null until the first evaluation;
+	// a failed compile is remembered so the interpreter is used without retrying.
+	mutable std::shared_ptr<CompiledSrt> compiled_srt;
+	mutable bool                         compiled_srt_attempted   = false;
+	mutable uint32_t                     compiled_srt_verify_left = 32;
 	bool                                requires_specialization_memory = false;
 	bool                                srt_plan_complete          = false;
 	bool                                resource_tracking_complete = false;
 	ShaderInfo                          info;
-	UniformFillPlan                     uniform_fill;
 };
 
 struct Program: ResourcePlan {

@@ -1,6 +1,7 @@
 #include "common/threads.h"
 
 #include "common/assert.h"
+#include "common/debug.h"
 
 #include <algorithm>
 #include <atomic>
