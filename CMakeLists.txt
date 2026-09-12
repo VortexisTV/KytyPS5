@@ -12,6 +12,20 @@ endif()
 
 project(Kyty)
 
+option(KYTY_ENABLE_IPO "Enable interprocedural optimization for release builds" ON)
+if(KYTY_ENABLE_IPO)
+	include(CheckIPOSupported)
+	check_ipo_supported(RESULT KYTY_IPO_SUPPORTED OUTPUT KYTY_IPO_ERROR)
+	if(KYTY_IPO_SUPPORTED)
+		# Official GitHub builds enable IPO explicitly. Keep local release builds on the
+		# same optimized code-generation path unless the user opts out.
+		set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+		set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELWITHDEBINFO ON)
+	else()
+		message(WARNING "Interprocedural optimization is unavailable: ${KYTY_IPO_ERROR}")
+	endif()
+endif()
+
 set(KYTY_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src")
 set(KYTY_TESTS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tests")
 set(KYTY_THIRD_PARTY_DIR "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty")
