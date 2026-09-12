@@ -409,6 +409,19 @@ struct PipelineCache::ProgramCache {
 		completed.push_back(std::move(result));
 	}
 
+	void LogShaderCounts() const {
+		std::array<size_t, static_cast<size_t>(ShaderType::Mesh) + 1> counts {};
+		for (const auto& [key, source]: programs) {
+			counts[static_cast<size_t>(key.stage)] += source.permutations.size();
+		}
+		// Guest geometry shaders are compiled through the host mesh stage.
+		std::printf("Shaders: VS %zu | PS %zu | CS %zu | GS %zu\n",
+		            counts[static_cast<size_t>(ShaderType::Vertex)],
+		            counts[static_cast<size_t>(ShaderType::Pixel)],
+		            counts[static_cast<size_t>(ShaderType::Compute)],
+		            counts[static_cast<size_t>(ShaderType::Mesh)]);
+	}
+
 	void DrainCompleted() {
 		std::vector<AsyncResult> done;
 		{
@@ -428,7 +441,7 @@ struct PipelineCache::ProgramCache {
 			}
 			if (result.permutation) {
 				entry->second.permutations.push_back(std::move(*result.permutation));
-				++num_compiled;
+				LogShaderCounts();
 			}
 			if (const auto pending_it = pending.find(result.key); pending_it != pending.end()) {
 				std::erase(pending_it->second, result.tag);
@@ -442,11 +455,11 @@ struct PipelineCache::ProgramCache {
 	template <typename InputInfo>
 	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info,
 	                  uint32_t& push_data_cursor) {
-		if (async) {
+		if (enqueue) {
 			DrainCompleted();
 		}
-		const auto stage             = StageOf(input_info);
-		const bool use_async = async && stage != ShaderType::Compute;
+		const auto stage     = StageOf(input_info);
+		const bool use_async = static_cast<bool>(enqueue) && stage != ShaderType::Compute;
 		lookup_key.stage           = stage;
 		lookup_key.hash            = params.hash;
 		lookup_key.user_data_count = static_cast<uint32_t>(params.user_data.size());
@@ -507,7 +520,7 @@ struct PipelineCache::ProgramCache {
 				entry->second.initial_translation.reset();
 				job->specialization = std::move(specialization);
 			}
-			Enqueue([this, job] { RunAsyncJob(*job); });
+			enqueue([this, job] { RunAsyncJob(*job); });
 			return {};
 		}
 
@@ -525,45 +538,14 @@ struct PipelineCache::ProgramCache {
 		input_info.stage = {.program = &permutation.program, .resources = std::move(resources)};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
 
-		++num_compiled;
+		LogShaderCounts();
 		return permutation.handle;
 	}
 
 	explicit ProgramCache(vk::Device device): device(device) {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
-		async = Config::AsyncShadersEnabled();
-		if (async) {
-			const auto hardware = std::thread::hardware_concurrency();
-			const auto count    = hardware > 2 ? hardware / 2 : 1;
-			for (uint32_t i = 0; i < count; i++) {
-				workers.emplace_back([this] {
-					for (;;) {
-						std::function<void()> job;
-						{
-							std::unique_lock lock(job_mutex);
-							job_available.wait(lock, [this] { return stop_workers || !jobs.empty(); });
-							if (stop_workers && jobs.empty()) {
-								return;
-							}
-							job = std::move(jobs.front());
-							jobs.pop_front();
-						}
-						job();
-					}
-				});
-			}
-		}
 	}
 	~ProgramCache() {
-		if (async) {
-			{
-				std::lock_guard lock(job_mutex);
-				stop_workers = true;
-			}
-			job_available.notify_all();
-			workers.clear();
-			DrainCompleted();
-		}
 		for (const auto& [key, entry]: programs) {
 			(void)key;
 			for (const auto& permutation: entry.permutations) {
@@ -572,37 +554,93 @@ struct PipelineCache::ProgramCache {
 		}
 	}
 
-	void Enqueue(std::function<void()> job) {
-		{
-			std::lock_guard lock(job_mutex);
-			jobs.push_back(std::move(job));
-		}
-		job_available.notify_one();
-	}
-
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
 	ProgramKey                                                  lookup_key;
 	vk::Device                                                  device;
 	std::atomic<uint64_t>                                       next_shader_id = 0;
-	std::atomic<uint32_t>                                       num_compiled = 0;
-	bool                                                        async = false;
-	std::mutex                                                  completed_mutex;
-	std::vector<AsyncResult>                                    completed;
-	std::unordered_map<ProgramKey, std::vector<uint64_t>, ProgramKeyHash> pending;
-	std::mutex                                                  job_mutex;
-	std::condition_variable                                     job_available;
-	std::deque<std::function<void()>>                           jobs;
-	std::vector<std::jthread>                                   workers;
-	bool                                                        stop_workers = false;
+
+	// Async translation: set by PipelineCache when workers are enabled. Its presence is what
+	// makes this cache asynchronous, so it doubles as the old `async` flag.
+	std::function<void(std::function<void()>)>                             enqueue;
+	std::mutex                                                             completed_mutex;
+	std::vector<AsyncResult>                                               completed;
+	std::unordered_map<ProgramKey, std::vector<uint64_t>, ProgramKeyHash>  pending;
 };
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
     : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
+	m_async = Config::AsyncShadersEnabled();
+	if (m_async) {
+		StartWorkers();
+		m_program_cache->enqueue = [this](std::function<void()> job) { EnqueueJob(std::move(job)); };
+	}
+}
+
+void PipelineCache::StartWorkers() {
+	const auto hardware = std::thread::hardware_concurrency();
+	const auto count    = hardware > 2 ? hardware / 2 : 1;
+	for (uint32_t i = 0; i < count; i++) {
+		m_workers.emplace_back([this] {
+			for (;;) {
+				std::function<void()> job;
+				{
+					std::unique_lock lock(m_job_mutex);
+					m_job_available.wait(lock, [this] { return m_stop_workers || !m_jobs.empty(); });
+					if (m_stop_workers && m_jobs.empty()) {
+						return;
+					}
+					job = std::move(m_jobs.front());
+					m_jobs.pop_front();
+				}
+				job();
+			}
+		});
+	}
+	PipelineCacheLog("Async shader pipelines: {} worker threads", count);
+}
+
+void PipelineCache::StopWorkers() {
+	{
+		std::lock_guard lock(m_job_mutex);
+		m_stop_workers = true;
+	}
+	m_job_available.notify_all();
+	m_workers.clear(); // joins
+}
+
+void PipelineCache::EnqueueJob(std::function<void()> job) {
+	{
+		std::lock_guard lock(m_job_mutex);
+		m_jobs.push_back(std::move(job));
+	}
+	m_job_available.notify_one();
+}
+
+// GPU thread: adopt pipelines the workers finished since the last lookup.
+void PipelineCache::DrainCompletedPipelines() {
+	std::vector<CompletedPipeline> completed;
+	{
+		std::lock_guard lock(m_completed_mutex);
+		completed.swap(m_completed_pipelines);
+	}
+	for (auto& done: completed) {
+		m_pending_pipelines.erase(done.key);
+		auto [iter, inserted] =
+		    m_graphics_pipelines.emplace(std::move(done.key), std::move(done.pipeline));
+		EXIT_IF(!inserted);
+	}
 }
 
 PipelineCache::~PipelineCache() {
+	// Workers must be joined before anything they touch is torn down, and whatever they finished
+	// has to land in the maps below so the destroy pass frees it.
+	if (m_async) {
+		StopWorkers();
+		DrainCompletedPipelines();
+		m_program_cache->DrainCompleted();
+	}
 	Save();
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& [key, pipeline]: pipelines) {
@@ -843,7 +881,7 @@ bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other)
 	return std::memcmp(this, &other, sizeof(*this)) == 0;
 }
 
-PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipeline(
+PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipeline(
     std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
     const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
@@ -982,65 +1020,62 @@ PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipeline(
 		EXIT_IF(attributes_num != static_cast<uint32_t>(vs_input_info.resources_num));
 	}
 
-	if (m_last_graphics_pipeline != nullptr && key == m_last_graphics_key) {
-		return *m_last_graphics_pipeline;
+	if (m_async) {
+		DrainCompletedPipelines();
+	}
+	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
+		return iter->second.get();
 	}
 
-	if (auto iter = m_graphics_pipelines.find(key);
-    	iter != m_graphics_pipelines.end()) {
-
-		m_last_graphics_key      = iter->first;
-		m_last_graphics_pipeline = iter->second.get();
-
-		return *iter->second;
+	if (m_async) {
+		if (m_pending_pipelines.contains(key)) {
+			return nullptr;
+		}
+		// Build on a worker. Everything the builder reads is copied; the program pointers inside
+		// the input infos stay valid because permutations live in a deque.
+		m_pending_pipelines.insert(key);
+		auto                                  vs_copy = std::make_shared<ShaderVertexInputInfo>(vs_input_info);
+		std::shared_ptr<ShaderPixelInputInfo> ps_copy;
+		if (ps_active) {
+			ps_copy = std::make_shared<ShaderPixelInputInfo>(*ps_input_info);
+		}
+		EnqueueJob([this, key, vs_copy, ps_copy, vertex_program, pixel_program]() mutable {
+			auto cached = std::make_unique<Pipeline>();
+			CreatePipelineInternal(m_graphics, *cached, key.rendering, key.vertex_input, *vs_copy,
+			                       vertex_program, ps_copy ? ps_copy.get() : nullptr, pixel_program,
+			                       key.static_params, m_driver_cache);
+			EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
+			EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
+			std::lock_guard lock(m_completed_mutex);
+			m_completed_pipelines.push_back({std::move(key), std::move(cached)});
+		});
+		return nullptr;
 	}
 
 	if (graphics_debug_dump_enabled()) {
 		ShaderDbgDumpInputInfo(vs_input_info);
-
 		if (ps_active) {
 			ShaderDbgDumpInputInfo(*ps_input_info);
 		}
-
-		LOGF(
-	    	"PipelineTrace: shader modules VS=%" PRIu64
-	    	" module=%p PS=%" PRIu64 " module=%p\n",
-	    	vs_id,
-	    	static_cast<void*>(vertex_program.module),
-	    	ps_id,
-	    	static_cast<void*>(pixel_program.module));
+		LOGF("PipelineTrace: shader modules VS=%" PRIu64 " module=%p PS=%" PRIu64 " module=%p\n",
+		     vs_id, static_cast<void*>(vertex_program.module), ps_id,
+		     static_cast<void*>(pixel_program.module));
 	}
 
 	auto cached = std::make_unique<Pipeline>();
-
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
-
-	CreatePipelineInternal(
-    	m_graphics,
-    	*cached,
-    	rendering,
-    	key.vertex_input,
-    	vs_input_info,
-    	vertex_program,
-    	ps_input_info,
-    	pixel_program,
-    	static_params,
-    	m_driver_cache);
-
+	CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vs_input_info,
+	                       vertex_program, ps_input_info, pixel_program, static_params,
+	                       m_driver_cache);
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
 
-	auto [iter, inserted] =
-    	m_graphics_pipelines.emplace(std::move(key), std::move(cached));
-
+	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 	EXIT_IF(!inserted);
 
-	m_last_graphics_key      = iter->first;
-	m_last_graphics_pipeline = iter->second.get();
-
-	return *iter->second;
+	return iter->second.get();
 }
 
 PipelineCache::Pipeline&

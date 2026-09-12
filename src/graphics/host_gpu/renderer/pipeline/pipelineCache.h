@@ -10,12 +10,19 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/shader.h"
 
+#include <condition_variable>
 #include <cstddef>
+#include <deque>
 #include <filesystem>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <span>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -138,7 +145,9 @@ public:
 	                                const HW::ShaderRegisters&   sh,
 	                                ShaderComputeInputInfo&      input_info);
 
-	Pipeline&
+	// Returns null while the pipeline is still being built on a worker thread (async mode); the
+	// caller skips the draw and retries on a later frame.
+	Pipeline*
 	CreateGraphicsPipeline(std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
 	                       const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
 	                       const ShaderPixelInputInfo* ps_input_info,
@@ -207,8 +216,6 @@ private:
 	};
 
 	GraphicContext&               m_graphics;
-	GraphicsPipelineKey 		  m_last_graphics_key {};
-	Pipeline*            		  m_last_graphics_pipeline = nullptr;
 	std::unique_ptr<ProgramCache> m_program_cache;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
@@ -217,7 +224,29 @@ private:
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 	Common::Mutex m_mutex;
 
+	// Asynchronous graphics pipeline construction. Keys being built live in m_pending_pipelines
+	// (GPU thread only); finished pipelines wait in m_completed_pipelines until the GPU thread
+	// drains them at its next lookup. The same worker pool also serves ProgramCache's shader
+	// translation jobs, through the enqueue callback installed in the constructor.
+	struct CompletedPipeline {
+		GraphicsPipelineKey       key;
+		std::unique_ptr<Pipeline> pipeline;
+	};
+	std::unordered_set<GraphicsPipelineKey, GraphicsPipelineKeyHash> m_pending_pipelines;
+	std::mutex                                                       m_completed_mutex;
+	std::vector<CompletedPipeline>                                   m_completed_pipelines;
+	std::mutex                                                       m_job_mutex;
+	std::condition_variable                                          m_job_available;
+	std::deque<std::function<void()>>                                m_jobs;
+	std::vector<std::jthread>                                        m_workers;
+	bool                                                             m_stop_workers = false;
+	bool                                                             m_async        = false;
+
 	void InitializeDriverCache();
+	void StartWorkers();
+	void StopWorkers();
+	void EnqueueJob(std::function<void()> job);
+	void DrainCompletedPipelines();
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
