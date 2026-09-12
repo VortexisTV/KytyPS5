@@ -554,7 +554,7 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
     : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
-	m_async = Config::AsyncShadersEnabled();
+	m_async = false;
 	if (m_async) {
 		StartWorkers();
 		m_program_cache->enqueue = [this](std::function<void()> job) {
