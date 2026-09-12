@@ -1,7 +1,6 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_PIPELINECACHE_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_PIPELINECACHE_H_
 
-#include <xxhash.h>
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
@@ -145,8 +144,8 @@ public:
 	                                const HW::ShaderRegisters&   sh,
 	                                ShaderComputeInputInfo&      input_info);
 
-	// Returns null while the pipeline is still being built on a worker thread (async mode); the
-	// caller skips the draw and retries on a later frame.
+	// Returns null while asynchronous shader or pipeline construction is still in progress. The
+	// caller should skip the draw and retry when the guest submits it again.
 	Pipeline*
 	CreateGraphicsPipeline(std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
 	                       const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
@@ -180,8 +179,10 @@ private:
 		}
 
 		static void MixStaticParams(std::size_t& hash, const PipelineStaticParameters& params) {
-			Mix(hash,
-	    	static_cast<std::size_t>(XXH3_64bits(&params, sizeof(params))));
+			const auto* bytes = reinterpret_cast<const uint8_t*>(&params);
+			for (std::size_t i = 0; i < sizeof(params); i++) {
+				Mix(hash, bytes[i]);
+			}
 		}
 
 		static void MixRendering(std::size_t& hash, const PipelineRenderingState& rendering) {
@@ -224,10 +225,6 @@ private:
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 	Common::Mutex m_mutex;
 
-	// Asynchronous graphics pipeline construction. Keys being built live in m_pending_pipelines
-	// (GPU thread only); finished pipelines wait in m_completed_pipelines until the GPU thread
-	// drains them at its next lookup. The same worker pool also serves ProgramCache's shader
-	// translation jobs, through the enqueue callback installed in the constructor.
 	struct CompletedPipeline {
 		GraphicsPipelineKey       key;
 		std::unique_ptr<Pipeline> pipeline;

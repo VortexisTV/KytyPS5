@@ -568,11 +568,8 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			EXIT("mixed color/depth sample counts are unsupported: %u and %u\n", attachment_samples,
 			     depth.desc.info.samples);
 		}
-		const auto write_aspects = depth.AttachmentWriteAspects();
-		
-		const bool feedback =
-		    pixel && write_aspects != vk::ImageAspectFlags {} &&
-			std::ranges::any_of(pixel->images, [&](const TextureBinding& binding) {
+		const bool feedback = depth.depth_write_enable && pixel &&
+		    std::ranges::any_of(pixel->images, [&](const TextureBinding& binding) {
 			    if (binding.image_id != depth.image_id ||
 			        binding.desc.type != TextureCache::BindingType::Texture) {
 				    return false;
@@ -582,7 +579,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			    EXIT_IF(native == image.views.end());
 			    const auto& sampled = native->info;
 			    const auto& target = depth.desc.view_info;
-			    return static_cast<bool>(sampled.aspect & write_aspects) &&
+			    return (sampled.aspect & vk::ImageAspectFlagBits::eDepth) &&
 			           ImageRangeOverlaps(sampled.base_level, sampled.level_count,
 			                              target.base_level, target.level_count) &&
 			           ImageRangeOverlaps(sampled.base_layer, sampled.layer_count,
@@ -1135,8 +1132,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
 	    state.programs.vertex, state.programs.pixel);
 	if (pipeline_ptr == nullptr) {
-		// The pipeline is still compiling on a worker; this draw is dropped for the frame. The
-		// caller resets the bindings on return.
+		// Shader modules or the graphics pipeline are still being built. The guest will submit the
+		// draw again on a later frame, after the completed result has been adopted.
 		return;
 	}
 	auto& pipeline = *pipeline_ptr;

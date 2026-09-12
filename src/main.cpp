@@ -69,8 +69,8 @@ static void PrintUsage() {
 	::printf("  --printf-direction <value>           Silent, Console, or File.\n");
 	::printf("  --printf-output-file <path>          Guest printf output file.\n");
 	::printf("  --profiler-direction <value>         None or Network.\n");
-	::printf("  --async-shaders <true|false>         Compile shaders on worker threads and skip\n"
-	         "                                       draws until ready. Default: true.\n");
+	::printf("  --async-shaders <true|false>         Build graphics shaders and pipelines on worker\n"
+	         "                                       threads; skip draws until ready. Default: true.\n");
 	::printf("  --spirv-debug-printf <true|false>    Enable SPIR-V debug printf.\n");
 	::printf(
 	    "  --readback-linear-images <true|false> Read back writable linear images on submit.\n");

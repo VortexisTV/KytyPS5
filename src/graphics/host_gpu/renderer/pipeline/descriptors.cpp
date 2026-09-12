@@ -128,33 +128,6 @@ static bool IsMultisampledTexture(Prospero::ImageType type) {
 	       type == Prospero::ImageType::kColor2DMsaaArray;
 }
 
-static uint64_t StorageBufferExtent(RenderContext& context,
-                                    const ShaderBufferResource& descriptor,
-                                    const ShaderRecompiler::IR::BufferResource& resource) {
-	const auto address = descriptor.Base48();
-	if (address == 0) {
-		return 0;
-	}
-	const auto stride  = descriptor.Stride();
-	const auto records = descriptor.NumRecords();
-	if (stride != 0 && records > UINT64_MAX / stride) {
-		EXIT("storage buffer descriptor footprint overflow\n");
-	}
-	const auto nominal = stride != 0 ? static_cast<uint64_t>(stride) * records : records;
-	constexpr uint64_t IndexedFetchCap = 64ull * 1024ull;
-	const bool indexed_fetch = resource.read && !resource.written && stride != 0;
-	if (nominal == 0 && !indexed_fetch) {
-		return 0;
-	}
-	const auto max_range = static_cast<uint64_t>(
-	    context.GetGraphics().GetPhysicalDeviceProperties().limits.maxStorageBufferRange);
-	const auto read_extent = std::min(max_range, IndexedFetchCap);
-	const auto requested = indexed_fetch && nominal < read_extent
-	                           ? read_extent
-	                           : std::min(nominal, max_range);
-	return Libs::LibKernel::Memory::ClampRangeSize(address, requested);
-}
-
 static vk::DescriptorBufferInfo
 NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource& source,
                     const ShaderRecompiler::IR::BufferResource& resource, ShaderType stage,
@@ -824,11 +797,15 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[i]);
 		const auto address = descriptor.Base48();
-		const auto size = StorageBufferExtent(m_context, descriptor, program.info.buffers[i]);
-		if (address == 0 || size == 0) {
+		const auto stride  = descriptor.Stride();
+		const auto records = descriptor.NumRecords();
+		// The descriptor has a 14-bit stride and 32-bit record count, so the product fits u64.
+		const auto requested_size = stride != 0 ? static_cast<uint64_t>(stride) * records : records;
+		if (address == 0 || requested_size == 0) {
 			prepared.buffer_sources.push_back({});
 			continue;
 		}
+		const auto size = Libs::LibKernel::Memory::ClampRangeSize(address, requested_size);
 		prepared.buffer_sources.push_back({address, size, cache.FindBuffer(address, size)});
 	}
 }
@@ -1018,16 +995,14 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					    std::ranges::find(image.views, binding.image_view, &CachedImageView::view);
 					EXIT_IF(storage || host_view == image.views.end());
 					const auto aspect = host_view->info.aspect;
-					const bool attachment_feedback =
+					const bool depth_feedback =
 					    layout == vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT &&
 					    program.stage == ShaderType::Pixel;
 					const bool depth_read =
-					    attachment_feedback ||
-						layout == vk::ImageLayout::eDepthReadOnlyOptimal ||
+					    depth_feedback || layout == vk::ImageLayout::eDepthReadOnlyOptimal ||
 					    layout == vk::ImageLayout::eDepthStencilReadOnlyOptimal ||
 					    layout == vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal;
 					const bool stencil_read =
-					    attachment_feedback ||
 					    layout == vk::ImageLayout::eStencilReadOnlyOptimal ||
 					    layout == vk::ImageLayout::eDepthStencilReadOnlyOptimal ||
 					    layout == vk::ImageLayout::eDepthAttachmentStencilReadOnlyOptimal;

@@ -293,23 +293,13 @@ const Elf64_Dyn* Elf64::GetDynValue(Elf64_Sxword tag) const {
 }
 
 std::vector<const Elf64_Dyn*> Elf64::GetDynList(Elf64_Sxword tag) const {
-    std::vector<const Elf64_Dyn*> ret;
-
-    const auto* dyn = GetDynamic();
-
-    if (dyn == nullptr) {
-        LOGF("Elf64::GetDynList: dynamic table is nullptr, tag=0x%016" PRIx64 "\n",
-             static_cast<uint64_t>(tag));
-        return ret;
-    }
-
-    for (; dyn->d_tag != DT_NULL; dyn++) {
-        if (dyn->d_tag == tag) {
-            ret.push_back(dyn);
-        }
-    }
-
-    return ret;
+	std::vector<const Elf64_Dyn*> ret;
+	for (const auto* dyn = GetDynamic(); dyn->d_tag != DT_NULL; dyn++) {
+		if (dyn->d_tag == tag) {
+			ret.push_back(dyn);
+		}
+	}
+	return ret;
 }
 
 bool Elf64::IsShared() const {

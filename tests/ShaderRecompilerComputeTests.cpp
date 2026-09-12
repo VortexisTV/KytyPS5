@@ -12103,18 +12103,15 @@ public:
                                    vertex_words);
     const auto pipeline = [&](bool enabled, uint8_t front, uint8_t back,
                               bool provoking_last = false) -> PipelineCache::Pipeline & {
-      // Async shaders are disabled for tests, so this never returns null.
       HW::ModeControl mode{};
       mode.poly_mode = enabled;
       mode.polymode_front_ptype = front;
       mode.polymode_back_ptype = back;
       mode.provoking_vtx_last = provoking_last;
       registers.SetModeControl(mode);
-      auto *created = context.GetPipelineCache().CreateGraphicsPipeline(
+      return *context.GetPipelineCache().CreateGraphicsPipeline(
           std::span{&color, 1u}, depth, vertex, scheduler.Current(), &pixel,
           vk::PrimitiveTopology::eTriangleList, false, vertex_shader, pixel_shader);
-      EXIT_IF(created == nullptr);
-      return *created;
     };
     auto &filled = pipeline(true, 2, 2);
     const auto draw = [&](const PipelineCache::Pipeline &selected) {

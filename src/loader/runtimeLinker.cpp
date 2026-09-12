@@ -787,12 +787,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		return true;
 	}
 
-if (info->type == Common::HostException::ExceptionType::AccessViolation) {
-
-	if (Libs::LibKernel::Memory::WaitForMappingTransition(info->access_violation_vaddr)) {
-		return true;
-	}
-
+	if (info->type == Common::HostException::ExceptionType::AccessViolation) {
 		using CoreAccess = Common::HostException::AccessViolationType;
 		using GpuAccess  = Libs::Graphics::PageFaultAccess;
 		GpuAccess access;
@@ -887,34 +882,9 @@ static void GetDynValue(Elf64* elf, T* out, Elf64_Sxword tag) {
 
 template <class T>
 static void GetDynValues(Elf64* elf, T* out, Elf64_Sxword tag) {
-    if (elf == nullptr) {
-        LOGF("GetDynValues: elf == nullptr, tag=0x%016" PRIx64 "\n",
-             static_cast<uint64_t>(tag));
-        return;
-    }
-
-    if (out == nullptr) {
-        LOGF("GetDynValues: out == nullptr, tag=0x%016" PRIx64 "\n",
-             static_cast<uint64_t>(tag));
-        return;
-    }
-
-    const auto dyn_list = elf->GetDynList(tag);
-
-    LOGF("GetDynValues: elf=%p dynamic=%p tag=0x%016" PRIx64 " count=%zu\n",
-         static_cast<void*>(elf),
-         static_cast<const void*>(elf->GetDynamic()),
-         static_cast<uint64_t>(tag),
-         dyn_list.size());
-
-    for (const auto* dyn: dyn_list) {
-        if (dyn == nullptr) {
-            LOGF("GetDynValues: nullptr entry\n");
-            continue;
-        }
-
-        out->push_back(dyn->d_un.d_val);
-    }
+	for (const auto* dyn: elf->GetDynList(tag)) {
+		out->push_back(dyn->d_un.d_val);
+	}
 }
 
 template <class T>
@@ -932,29 +902,11 @@ static void KYTY_SYSV_ABI ProgramExitHandler() {
 
 template <class T>
 static void GetDynModules(Elf64* elf, T* out, const char* names, Elf64_Sxword tag) {
-	if (elf == nullptr) {
-		LOGF("GetDynModules: elf == nullptr, tag=0x%016" PRIx64 "\n",
-		     static_cast<uint64_t>(tag));
-		return;
-	}
-
-	if (out == nullptr) {
-		LOGF("GetDynModules: out == nullptr, tag=0x%016" PRIx64 "\n",
-		     static_cast<uint64_t>(tag));
-		return;
-	}
-
-	if (names == nullptr) {
-		LOGF("GetDynModules: names/str_table == nullptr, tag=0x%016" PRIx64 "\n",
-		     static_cast<uint64_t>(tag));
-		return;
-	}
-
 	std::vector<uint64_t> needed_modules;
 	GetDynValues(elf, &needed_modules, tag);
-
 	for (auto need: needed_modules) {
 		ModuleId id {};
+		// id.id            = static_cast<int>((need >> 48u) & 0xffffu);
 		EncodeId64(static_cast<uint16_t>((need >> 48u) & 0xffffu), &id.id);
 		id.version_major = static_cast<int>((need >> 40u) & 0xffu);
 		id.version_minor = static_cast<int>((need >> 32u) & 0xffu);
@@ -965,18 +917,11 @@ static void GetDynModules(Elf64* elf, T* out, const char* names, Elf64_Sxword ta
 
 template <class T>
 static void GetDynLibs(Elf64* elf, T* out, const char* names, Elf64_Sxword tag) {
-	if (elf == nullptr || out == nullptr || names == nullptr) {
-		LOGF("GetDynLibs: null argument, elf=%p out=%p names=%p tag=0x%016" PRIx64 "\n",
-		     static_cast<void*>(elf), static_cast<void*>(out),
-		     static_cast<const void*>(names), static_cast<uint64_t>(tag));
-		return;
-	}
-
 	std::vector<uint64_t> needed_modules;
 	GetDynValues(elf, &needed_modules, tag);
-
 	for (auto need: needed_modules) {
 		LibraryId id {};
+		// id.id      = static_cast<int>((need >> 48u) & 0xffffu);
 		EncodeId64(static_cast<uint16_t>((need >> 48u) & 0xffffu), &id.id);
 		id.version = static_cast<int>((need >> 32u) & 0xffffu);
 		id.name    = names + (need & 0xffffffff);
