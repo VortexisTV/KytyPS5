@@ -568,23 +568,33 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			EXIT("mixed color/depth sample counts are unsupported: %u and %u\n", attachment_samples,
 			     depth.desc.info.samples);
 		}
-		const bool feedback = depth.depth_write_enable && pixel &&
-		    std::ranges::any_of(pixel->images, [&](const TextureBinding& binding) {
-			    if (binding.image_id != depth.image_id ||
-			        binding.desc.type != TextureCache::BindingType::Texture) {
-				    return false;
-			    }
-			    const auto native =
-			        std::ranges::find(image.views, binding.image_view, &CachedImageView::view);
-			    EXIT_IF(native == image.views.end());
-			    const auto& sampled = native->info;
-			    const auto& target = depth.desc.view_info;
-			    return (sampled.aspect & vk::ImageAspectFlagBits::eDepth) &&
-			           ImageRangeOverlaps(sampled.base_level, sampled.level_count,
-			                              target.base_level, target.level_count) &&
-			           ImageRangeOverlaps(sampled.base_layer, sampled.layer_count,
-			                              target.base_layer, target.layer_count);
-		    });
+	const auto write_aspects = depth.AttachmentWriteAspects();
+
+	const bool feedback =
+    	pixel && write_aspects != vk::ImageAspectFlags {} &&
+    	std::ranges::any_of(pixel->images, [&](const TextureBinding& binding) {
+        	if (binding.image_id != depth.image_id ||
+            	binding.desc.type != TextureCache::BindingType::Texture) {
+            	return false;
+        	}
+
+        	const auto native =
+            	std::ranges::find(image.views, binding.image_view, &CachedImageView::view);
+        		EXIT_IF(native == image.views.end());
+
+        	const auto& sampled = native->info;
+        	const auto& target  = depth.desc.view_info;
+
+        	return static_cast<bool>(sampled.aspect & write_aspects) &&
+               	ImageRangeOverlaps(sampled.base_level,
+                                  sampled.level_count,
+                                  target.base_level,
+                                  target.level_count) &&
+               	ImageRangeOverlaps(sampled.base_layer,
+                                  sampled.layer_count,
+                                  target.base_layer,
+                                  target.layer_count);
+    	});
 		if (feedback && !m_context.GetGraphics().attachment_feedback_loop_enabled) {
 			EXIT("depth attachment feedback loop is not supported by the host\n");
 		}
@@ -1182,11 +1192,14 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	SetGraphicsDynamicParams(buffer, vk_buffer, state.vs_input_info, state.color_info,
 	                         state.color_count, state.depth_info);
 	if (m_context.GetGraphics().attachment_feedback_loop_enabled) {
-		vk_buffer.setAttachmentFeedbackLoopEnableEXT(
-		    rendering.depth_stencil_attachment.image_layout ==
-		            vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
-		        ? vk::ImageAspectFlags {vk::ImageAspectFlagBits::eDepth}
-		        : vk::ImageAspectFlags {});
+    	const bool feedback =
+        	rendering.depth_stencil_attachment.image_layout ==
+        	vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT;
+
+    	vk_buffer.setAttachmentFeedbackLoopEnableEXT(
+        	feedback
+            	? state.depth_info.AttachmentWriteAspects()
+            	: vk::ImageAspectFlags {});
 	}
 
 	LogDrawPhase(draw.name, "BeginRendering");
