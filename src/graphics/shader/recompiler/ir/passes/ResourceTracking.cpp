@@ -89,6 +89,7 @@ public:
 		m_info.samplers.clear();
 		m_info.sampled_pairs.clear();
 		m_info.uses_dma = false;
+		m_info.dma_address_registers.clear();
 	}
 
 	void Run() {
@@ -566,6 +567,69 @@ private:
 		source = InternSource(descriptor);
 	}
 
+	// Collects the user-data registers a data value is computed from. Boolean operands only steer
+	// selects and carries, and memory loads name pointers stored elsewhere, so neither contributes an
+	// address register.
+	static void CollectUserDataRoots(Value value, std::vector<uint32_t>& registers,
+	                                 std::vector<const Inst*>& visited) {
+		constexpr size_t MaxVisited = 256;
+		value            = value.Resolve();
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr || visited.size() >= MaxVisited ||
+		    std::ranges::find(visited, inst) != visited.end()) {
+			return;
+		}
+		visited.push_back(inst);
+		const auto op = inst->GetOpcode();
+		if (op == ValueOpcode::GetUserData) {
+			const auto reg = inst->Arg(0);
+			if (reg.GetType() == Type::ScalarReg) {
+				const auto index = static_cast<uint32_t>(RegIndex(reg.ScalarRegister()));
+				if (std::ranges::find(registers, index) == registers.end()) {
+					registers.push_back(index);
+				}
+			}
+			return;
+		}
+		if (op == ValueOpcode::ReadConst || op == ValueOpcode::ReadConstBuffer ||
+		    BufferAccessOf(op) != BufferAccess::None || SharedAccessOf(op) != SharedAccess::None ||
+		    AddressOpcodeInfoOf(op).access != AddressAccess::None ||
+		    ImageOpcodeInfoOf(op).access != ImageAccess::None) {
+			return;
+		}
+		for (uint32_t index = 0; index < inst->NumArgs(); index++) {
+			const auto arg = inst->Arg(index);
+			if (arg.GetType() != Type::U1) {
+				CollectUserDataRoots(arg, registers, visited);
+			}
+		}
+	}
+
+	// A DMA address is a 64-bit value split over a low and a high dword. When the low dword derives
+	// from user data R and the high dword from R + 1, the pair names the guest memory the shader reads.
+	void RecordDmaAddressRegisters(const Inst& inst, const MemoryInfo& memory) {
+		const auto* handle = inst.Arg(0).Resolve().TryInstruction();
+		if (handle == nullptr || handle->NumArgs() != 2 ||
+		    (memory.address_is_full && inst.NumArgs() < 3)) {
+			return;
+		}
+		const auto               low  = memory.address_is_full ? inst.Arg(1) : handle->Arg(0);
+		const auto               high = memory.address_is_full ? inst.Arg(2) : handle->Arg(1);
+		std::vector<uint32_t>    low_roots;
+		std::vector<uint32_t>    high_roots;
+		std::vector<const Inst*> visited;
+		CollectUserDataRoots(low, low_roots, visited);
+		visited.clear();
+		CollectUserDataRoots(high, high_roots, visited);
+		auto& registers = m_info.dma_address_registers;
+		for (const auto reg: low_roots) {
+			if (std::ranges::find(high_roots, reg + 1u) != high_roots.end() &&
+			    std::ranges::find(registers, reg) == registers.end()) {
+				registers.push_back(reg);
+			}
+		}
+	}
+
 	void ValidateAddressHandle(Value value, uint32_t pc) const {
 		const auto* handle = value.Resolve().TryInstruction();
 		if (handle == nullptr || handle->GetOpcode() != ValueOpcode::GetAddressResource) {
@@ -759,6 +823,7 @@ private:
 				return;
 			}
 			ValidateAddressHandle(inst.Arg(0), flags.pc);
+			RecordDmaAddressRegisters(inst, memory);
 			m_info.uses_dma = true;
 			return;
 		}

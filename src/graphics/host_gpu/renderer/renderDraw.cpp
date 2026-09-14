@@ -420,9 +420,12 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 #else
 	vk::Bool32 enable[RENDER_COLOR_ATTACHMENTS_MAX] = {};
 	// Color-control operation selects special color-buffer paths, not the normal component write
-	// mask. Attachment availability therefore follows the target write mask.
+	// mask. Attachment availability therefore follows the target write mask, limited to the
+	// channels the pixel shader exports (CB_SHADER_MASK), as the hardware combines both.
 	for (uint32_t i = 0; i < color_count; i++) {
-		enable[i] = render_target_mask_slot(ctx.GetRenderTargetMask(), colors[i].target_slot) != 0
+		enable[i] = render_target_write_mask_slot(ctx.GetRenderTargetMask(),
+		                                          ctx.GetShaderRegisters().m_cbShaderMask,
+		                                          colors[i].target_slot) != 0
 		                ? VK_TRUE
 		                : VK_FALSE;
 	}

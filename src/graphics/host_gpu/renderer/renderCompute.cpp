@@ -432,6 +432,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	auto bindings = PrepareBindings(input_info.stage);
 	FindBuffers(bindings);
 	if (program.info.uses_dma) {
+		PrepareDmaSources(bindings);
 		m_context.GetGpuResources().PrepareBda();
 	}
 	RebindBuffers(bindings);

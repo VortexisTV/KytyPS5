@@ -981,12 +981,17 @@ PipelineCache::GraphicsPipeline* PipelineCache::CreateGraphicsPipeline(
 	Common::LockGuard lock(m_mutex);
 	auto&             ctx = command.GetRegisters();
 
+	// A PS5 color target is written only where CB_TARGET_MASK and the pixel shader's CB_SHADER_MASK
+	// agree. Vulkan leaves an attachment undefined when the fragment shader has no output for it, so
+	// channels the shader does not export are masked out instead of staying write-enabled.
 	uint32_t color_mask[RENDER_COLOR_ATTACHMENTS_MAX] = {};
 	for (uint32_t i = 0; i < color_count; i++) {
 		color_mask[i] =
-		    (colors[i].image_id ? colors[i].export_mapping.ApplyMask(render_target_mask_slot(
-		                              ctx.GetRenderTargetMask(), colors[i].target_slot))
-		                        : 0);
+		    (colors[i].image_id
+		         ? colors[i].export_mapping.ApplyMask(render_target_write_mask_slot(
+		               ctx.GetRenderTargetMask(), ctx.GetShaderRegisters().m_cbShaderMask,
+		               colors[i].target_slot))
+		         : 0);
 	}
 	const HW::ModeControl& mc = ctx.GetModeControl();
 

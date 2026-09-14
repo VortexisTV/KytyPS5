@@ -19,6 +19,7 @@
 #include "graphics/host_gpu/renderer/cache/gpuResourceManager.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
+#include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
 #include "graphics/host_gpu/renderer/image/image.h"
@@ -24997,6 +24998,28 @@ void CheckReferenceClockScale() {
   std::printf("[host]    %-32s ok\n", "ReferenceClockScale");
 }
 
+void CheckRenderTargetWriteMask() {
+  constexpr const char *name = "RenderTargetWriteMask";
+  // GTA V's GBuffer draw exports four RGBA targets and only RG of the fifth.
+  Require(name, "partial export",
+          render_target_write_mask_slot(0x000fffffu, 0x0003ffffu, 0) == 0xfu &&
+              render_target_write_mask_slot(0x000fffffu, 0x0003ffffu, 4) ==
+                  0x3u,
+          "shader-exported channels were not preserved");
+  // A decal draw that exports slot 0 leaves the other bound targets untouched
+  // instead of writing undefined fragment outputs into them.
+  Require(name, "unexported targets",
+          render_target_write_mask_slot(0x000fffffu, 0x0000000fu, 1) == 0u &&
+              render_target_write_mask_slot(0x000fffffu, 0x0000000fu, 4) ==
+                  0u,
+          "targets without a shader export stayed write-enabled");
+  Require(name, "target mask",
+          render_target_write_mask_slot(0x000000f1u, 0x000000ffu, 0) == 0x1u &&
+              render_target_write_mask_slot(0x00000000u, 0xffffffffu, 2) == 0u,
+          "the target mask no longer limited shader exports");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckClipControlDepthClipState() {
   HW::ClipControl clip;
   Require("ClipControlDepthClipState", "default", clip.IsZClipEnabled(),
@@ -26070,6 +26093,11 @@ int main(int argc, char **argv) {
     return 0;
   }
 #endif
+  if (argc == 2 &&
+      std::strcmp(argv[1], "--render-target-write-mask-only") == 0) {
+    CheckRenderTargetWriteMask();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--clip-control-only") == 0) {
     CheckClipControlDepthClipState();
     return 0;
@@ -26359,6 +26387,7 @@ int main(int argc, char **argv) {
 #endif
   CheckImageSamplerSpecialization();
   CheckNativeImageDescriptorTypes();
+  CheckRenderTargetWriteMask();
   CheckClipControlDepthClipState();
   CheckReferenceClockScale();
   CheckVulkan13FeatureRequirements();

@@ -1267,6 +1267,63 @@ void TestDynamicFlatAddressesUseDma() {
         "dynamic FLAT address did not enable DMA");
 }
 
+void TestDmaAddressRegisters() {
+  {
+    Fixture fixture;
+    const auto based =
+        fixture.Address(fixture.UserData(4), fixture.UserData(5), 4);
+    MemoryInfo global;
+    global.kind = ResourceKind::Global;
+    fixture.Emit(ValueOpcode::LoadAddressU32,
+                 {based, Value(0u), Value(0u), Value(true)},
+                 fixture.AddMemory(global, 4));
+    fixture.PlanAndTrack();
+    Check(fixture.program.info.dma_address_registers ==
+              std::vector<uint32_t>{4u},
+          "user-data DMA address base was not recorded");
+  }
+  {
+    // A full address the shader computes itself, the way GTA V's glyph blit
+    // adds an offset to a pointer held in user data 12/13. The exec condition
+    // and carry selector read other user data that must not pair up.
+    Fixture fixture;
+    const auto active = fixture.Emit(ValueOpcode::INotEqual32,
+                                     {fixture.UserData(11), Value(0u)});
+    const auto low =
+        fixture.Emit(ValueOpcode::IAdd32, {fixture.UserData(12), Value(64u)});
+    const auto carry =
+        fixture.Emit(ValueOpcode::SelectU32, {active, Value(1u), Value(0u)});
+    const auto high =
+        fixture.Emit(ValueOpcode::IAdd32, {fixture.UserData(13), carry});
+    const auto address = fixture.Address(low, high, 0xa4);
+    MemoryInfo flat;
+    flat.kind = ResourceKind::Flat;
+    flat.address_is_full = true;
+    fixture.Emit(ValueOpcode::LoadAddressU8, {address, low, high, active},
+                 fixture.AddMemory(flat, 0xa4));
+    fixture.PlanAndTrack();
+    Check(fixture.program.info.uses_dma &&
+              fixture.program.info.dma_address_registers ==
+                  std::vector<uint32_t>{12u},
+          "computed DMA address did not record only its user-data base");
+  }
+  {
+    Fixture fixture;
+    const auto undef = fixture.Emit(ValueOpcode::UndefU32);
+    const auto unbased = fixture.Address(undef, undef, 8);
+    MemoryInfo flat;
+    flat.kind = ResourceKind::Flat;
+    flat.address_is_full = true;
+    fixture.Emit(ValueOpcode::StoreAddressU32,
+                 {unbased, Value(0u), Value(0u), Value(9u), Value(true)},
+                 fixture.AddMemory(flat, 8));
+    fixture.PlanAndTrack();
+    Check(fixture.program.info.uses_dma &&
+              fixture.program.info.dma_address_registers.empty(),
+          "DMA address without user-data roots recorded a register");
+  }
+}
+
 void TestBufferSwizzleSpecialization() {
   Fixture fixture;
   const auto handle = fixture.Buffer({fixture.UserData(0), fixture.UserData(1),
@@ -1608,6 +1665,7 @@ int main() {
         TestDynamicScalarDescriptorTupleUsesDma);
     Run("DMA address materialization", TestDmaAddressMaterialization);
     Run("dynamic FLAT address", TestDynamicFlatAddressesUseDma);
+    Run("DMA address registers", TestDmaAddressRegisters);
     Run("buffer swizzle specialization", TestBufferSwizzleSpecialization);
     Run("shader info and bindings", TestShaderInfoAndBindingLayout);
     Run("image binding ABI", TestImageBindingAbi);

@@ -419,6 +419,9 @@ struct ShaderInfo {
 	int32_t                          instance_offset_sgpr = -1;
 	bool                             has_bitwise_xor    = false;
 	bool                             uses_dma           = false;
+	// Low user-data registers R whose dwords R and R + 1 form the base of a DMA address. The renderer
+	// caches those guest pages before the shader runs, so its first reads see guest memory.
+	std::vector<uint32_t> dma_address_registers;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };

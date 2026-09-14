@@ -28,6 +28,7 @@ struct ScissorRect {
 };
 
 uint32_t                 render_target_mask_slot(uint32_t mask, uint32_t slot);
+uint32_t render_target_write_mask_slot(uint32_t target_mask, uint32_t shader_mask, uint32_t slot);
 uint32_t                 render_target_first_bound_slot(const CommandBuffer& buffer);
 bool                     graphics_debug_dump_enabled();
 void                     uc_print(const char* func, const HW::UserConfig& uc);

@@ -720,6 +720,7 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	if (image.backing.format == vk::Format::eUndefined) {
 		EXIT("unsupported presentation source, image=%p\n", static_cast<const void*>(&image));
 	}
+	FrameDumpOnFlip(m_impl->renderer, info.data.address);
 
 	auto frame_format = info.pixel_format;
 	switch (frame_format) {
