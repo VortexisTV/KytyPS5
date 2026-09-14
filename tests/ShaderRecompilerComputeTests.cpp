@@ -7077,6 +7077,99 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  void CheckStorageSampledFormatSeparation() {
+    constexpr const char *name = "StorageSampledFormatSeparation";
+    constexpr uintptr_t base = 0x0000000205000000ull;
+    constexpr uint64_t allocation_size = 0x1000000;
+    constexpr uint64_t atlas_size = 0x800000;
+    constexpr uint32_t width = 2048;
+    constexpr uint32_t height = 4096;
+    EnsureRuntimeContext();
+    auto &context = Renderer();
+    CommandScheduler scheduler(context, m_runtime_context);
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    auto &gpu = context.GetGpu();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, 0x200000, 0, &direct_offset) == 0,
+            "storage/sample direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                0x200000) == 0 && mapped == reinterpret_cast<void *>(base),
+            "storage/sample fixed mapping failed");
+    std::memset(mapped, 0x7f, atlas_size);
+
+    {
+      GpuResourceManager resources(m_runtime_context, scheduler);
+      resources.SetGpu(&gpu);
+      resources.MapMemory(base, allocation_size);
+      auto MakeAtlasDesc = [&](BindingType type, vk::Format pixel_format,
+                               Prospero::BufferFormat guest_format,
+                               vk::ImageUsageFlags usage) {
+        ImageDesc desc{};
+        desc.type = type;
+        desc.info.data = {base, atlas_size};
+        desc.info.pixel_format = pixel_format;
+        desc.info.guest_format = guest_format;
+        desc.info.type = Prospero::ImageType::kColor2D;
+        desc.info.extent = {width, height, 1};
+        desc.info.resources = {1, 1};
+        desc.info.pitch = width;
+        desc.info.bytes_per_block = 1;
+        desc.info.samples = 1;
+        desc.info.tile_mode = Prospero::TileMode::kLinear;
+        desc.info.mip_layout[0] = {0, atlas_size, width, height};
+        desc.view_info.format = pixel_format;
+        desc.view_info.type = vk::ImageViewType::e2D;
+        desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+        desc.view_info.usage = usage;
+        return desc;
+      };
+
+      auto &texture_cache = resources.GetTextureCache();
+      auto storage = MakeAtlasDesc(BindingType::Storage, vk::Format::eR8Uint,
+                                   Prospero::BufferFormat::k8UInt,
+                                   vk::ImageUsageFlagBits::eStorage);
+      const auto storage_id = texture_cache.FindImage(storage);
+      (void)texture_cache.FindTexture(storage_id, storage);
+      auto sampled = MakeAtlasDesc(BindingType::Texture, vk::Format::eR8Unorm,
+                                   Prospero::BufferFormat::k8UNorm,
+                                   vk::ImageUsageFlagBits::eSampled);
+      const auto sampled_id = texture_cache.FindImage(sampled);
+      Require(name, "numeric-format separation",
+              storage_id && sampled_id && storage_id != sampled_id &&
+                  !TextureCacheTestAccess::Contains(texture_cache, storage_id),
+              "R8 integer storage and normalized sampled atlas shared one cache image");
+
+      uint8_t published = 0;
+      Require(name, "storage contents publication",
+              Libs::LibKernel::Memory::TryReadBacking(
+                  base, &published, sizeof(published)) &&
+                  published == 0x7f,
+              "separating the storage owner failed to publish its guest bytes");
+      resources.SetGpu(nullptr);
+      resources.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "storage/sample direct mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "storage/sample direct-memory release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckBgra16Readback() {
     constexpr const char *name = "Bgra16Readback";
     constexpr uintptr_t base = 0x0000000204000000ull;
@@ -7569,7 +7662,6 @@ public:
               color.image_id &&
                   color.desc.info.metadata.kind == ImageMetadataKind::Dcc &&
                   color.desc.info.metadata.range.address == dcc_address &&
-                  color.metadata_fixed_clear_supported &&
                   rendering.num_color_attachments == 1 &&
                   rendering.color_attachments[0].is_clear &&
                   rendering.color_attachments[0].clear_value ==
@@ -26116,6 +26208,11 @@ int main(int argc, char **argv) {
     vulkan.CheckBgra16Readback();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--dcc-fixed-clear-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckRenderExecutorDccFixedClearFloat();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--htile-clear-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckUnifiedTextureCacheFlow();
@@ -26138,7 +26235,7 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--storage-sampled-only") == 0) {
     VulkanHarness vulkan;
-    vulkan.CheckUnifiedImageViewCache();
+    vulkan.CheckStorageSampledFormatSeparation();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--depth-readback-only") == 0) {
