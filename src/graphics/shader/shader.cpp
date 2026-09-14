@@ -814,6 +814,13 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 		}
 		key.push_back(packed);
 	}
+	for (uint32_t base = 0; base < info.target_attachment.size(); base += 4u) {
+		uint32_t packed = 0;
+		for (uint32_t i = 0; i < 4u; i++) {
+			packed |= static_cast<uint32_t>(info.target_attachment[base + i]) << (i * 8u);
+		}
+		key.push_back(packed);
+	}
 	key.insert(key.end(), std::begin(info.interpolator_settings),
 	           std::begin(info.interpolator_settings) + info.input_num);
 }

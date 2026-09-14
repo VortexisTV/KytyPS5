@@ -98,15 +98,6 @@ public:
 	void ProcessDownloadImages();
 	void RunGarbageCollector();
 
-	// Debug capture only: visits every live image under the cache lock. The callback must not
-	// re-enter the cache.
-	template <typename F>
-	void DebugForEachImage(F&& fn) {
-		m_lock.lock();
-		m_slot_images.ForEach(fn);
-		m_lock.unlock();
-	}
-
 private:
 	enum class TransferDirection { Upload, Download };
 	struct ColorTransferPlan;

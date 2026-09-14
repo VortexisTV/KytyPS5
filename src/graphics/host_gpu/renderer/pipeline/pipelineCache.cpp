@@ -884,11 +884,15 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
     const HW::ShaderRegisters& sh, const HW::Context& context,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
-    bool pixel_active, ShaderVertexInputInfo& vertex_info, ShaderPixelInputInfo& pixel_info) {
+    std::span<const uint8_t, 8> target_attachment, bool pixel_active,
+    ShaderVertexInputInfo& vertex_info, ShaderPixelInputInfo& pixel_info) {
 	const auto vertex_params = PrepareProgram(vertex_regs, sh, vertex_info);
 	ShaderParams pixel_params;
 	if (pixel_active) {
 		pixel_params = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
+		for (size_t slot = 0; slot < target_attachment.size(); slot++) {
+			pixel_info.target_attachment[slot] = target_attachment[slot];
+		}
 	}
 	if (context.GetClipControl().clip_disable) {
 		const auto& viewport = context.GetScreenViewport().viewports[0];

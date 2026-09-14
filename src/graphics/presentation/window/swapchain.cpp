@@ -5,7 +5,6 @@
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
-#include "graphics/host_gpu/renderer/frameDump.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vma.h"
@@ -721,7 +720,6 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	if (image.backing.format == vk::Format::eUndefined) {
 		EXIT("unsupported presentation source, image=%p\n", static_cast<const void*>(&image));
 	}
-	FrameDumpOnFlip(m_impl->renderer, info.data.address);
 
 	auto frame_format = info.pixel_format;
 	switch (frame_format) {
