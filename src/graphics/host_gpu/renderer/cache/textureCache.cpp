@@ -103,6 +103,35 @@ std::vector<uint32_t> BuildNeutralColorGradingLut() {
 	return "Image";
 }
 
+[[nodiscard]] bool IsStorageSampledFormatMismatch(const Image& cached,
+                                                  const ImageInfo& requested,
+                                                  TextureCache::BindingType binding) noexcept {
+	const bool requested_storage = binding == TextureCache::BindingType::Storage;
+	const bool requested_sampled = binding == TextureCache::BindingType::Texture;
+	if (!requested_storage && !requested_sampled) {
+		return false;
+	}
+	if (requested_storage == cached.usage.storage ||
+	    cached.info.data.address != requested.data.address ||
+	    cached.info.data.size != requested.data.size || cached.info.type != requested.type ||
+	    cached.info.extent != requested.extent || cached.info.resources != requested.resources ||
+	    cached.info.samples != requested.samples || cached.info.tile_mode != requested.tile_mode ||
+	    cached.info.bytes_per_block != requested.bytes_per_block || cached.info.IsBlock() ||
+	    cached.info.IsDepth() || cached.info.HasMetadata() || cached.info.HasStencil() ||
+	    cached.info.IsVolume() || requested.IsBlock() || requested.IsDepth() ||
+	    requested.HasMetadata() || requested.HasStencil() || requested.IsVolume()) {
+		return false;
+	}
+	const bool r8_integer_normalized =
+	    (cached.info.guest_format == Prospero::BufferFormat::k8UInt &&
+	     requested.guest_format == Prospero::BufferFormat::k8UNorm) ||
+	    (cached.info.guest_format == Prospero::BufferFormat::k8UNorm &&
+	     requested.guest_format == Prospero::BufferFormat::k8UInt);
+	return r8_integer_normalized &&
+	       (cached.info.guest_format != requested.guest_format ||
+	        cached.info.pixel_format != requested.pixel_format);
+}
+
 void NameImageBinding(GraphicContext& graphics, Image& image, vk::ImageView view,
                       TextureCache::BindingType type, const ImageViewInfo& view_info) {
 	const auto* role = BindingTypeName(type);
@@ -766,6 +795,9 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		return {merged_id};
 	}
 	auto&      cached       = *owner;
+	if (IsStorageSampledFormatMismatch(cached, requested, binding)) {
+		return {merged_id};
+	}
 	const auto current_tick = m_scheduler.CurrentTick();
 	const bool safe_to_delete =
 	    current_tick - std::min(current_tick, cached.tick_accessed_last) > NumFramesBeforeRemoval;
@@ -877,6 +909,77 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		}
 	}
 	return {merged_id};
+}
+
+void TextureCache::PrepareStorageSampledOverlap(const ImageDesc& desc) {
+	if (desc.type != BindingType::Texture && desc.type != BindingType::Storage) {
+		return;
+	}
+
+	std::vector<ImageId> candidates;
+	std::vector<ImageId> gpu_candidates;
+	{
+		std::scoped_lock lock {m_lock};
+		for (const auto id: FindImagesInRegion(desc.info.data.address, desc.info.data.size, false)) {
+			const auto* image = m_slot_images.try_get(id);
+			if (image == nullptr ||
+			    !IsStorageSampledFormatMismatch(*image, desc.info, desc.type)) {
+				continue;
+			}
+			candidates.push_back(id);
+			if (image->IsGpuModified()) {
+				gpu_candidates.push_back(id);
+			}
+		}
+	}
+	if (candidates.empty()) {
+		return;
+	}
+
+	// GTA V writes its R8 glyph atlas as integers and samples the same bytes as normalized values.
+	// Publish a live storage owner before replacing it with the sampled-format image.
+	if (!gpu_candidates.empty()) {
+		{
+			std::scoped_lock lock {m_lock};
+			for (const auto id: gpu_candidates) {
+				if (m_slot_images.try_get(id) == nullptr || !TryDownloadImage(id)) {
+					EXIT("TextureCache: cannot publish storage image before format reinterpretation "
+					     "at 0x%016" PRIx64 "\n",
+					     desc.info.data.address);
+				}
+			}
+		}
+		const auto tick = m_scheduler.CurrentTick();
+		m_scheduler.Finish();
+		m_scheduler.WaitPriorityOperations(tick);
+		std::scoped_lock lock {m_lock};
+		for (const auto id: gpu_candidates) {
+			auto* image = m_slot_images.try_get(id);
+			if (image == nullptr) {
+				continue;
+			}
+			const auto range = image->info.data;
+			image->ClearGpuModified();
+			m_download_images.erase(id);
+			m_buffer_cache.InvalidateMemory(range.address, range.size);
+		}
+	}
+
+	// The two numeric interpretations cannot share a Vulkan image view. Retire the old owner so the
+	// next lookup uploads a correctly typed image from the now-current guest backing.
+	std::scoped_lock lock {m_lock};
+	for (const auto id: candidates) {
+		auto* image = m_slot_images.try_get(id);
+		if (image == nullptr || !image->registered) {
+			continue;
+		}
+		if (image->IsGpuModified()) {
+			EXIT("TextureCache: cannot separate storage/sampled image without readback at "
+			     "0x%016" PRIx64 "\n",
+			     image->info.data.address);
+		}
+		FreeImage(id);
+	}
 }
 
 ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
@@ -1215,6 +1318,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		std::scoped_lock lock {m_lock};
 		return GetNullImage(desc);
 	}
+	PrepareStorageSampledOverlap(desc);
 
 	ImageId result {};
 	{
@@ -1224,7 +1328,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 
 		for (const auto id: candidates) {
 			const auto& image = m_slot_images[id];
-			if (SameBacking(image.info, desc.info, exact_format)) {
+			if (!IsStorageSampledFormatMismatch(image, desc.info, desc.type) &&
+			    SameBacking(image.info, desc.info, exact_format)) {
 				result = id;
 			}
 		}
@@ -1342,6 +1447,7 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 		}
 	}
 	if (desc.type == BindingType::Storage) {
+		image.usage.storage = true;
 		image.MarkGpuModified();
 	}
 	if (!image.info.data.Empty()) {

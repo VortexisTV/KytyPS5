@@ -884,11 +884,15 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
     const HW::ShaderRegisters& sh, const HW::Context& context,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
-    bool pixel_active, ShaderVertexInputInfo& vertex_info, ShaderPixelInputInfo& pixel_info) {
+    std::span<const uint8_t, 8> target_attachment, bool pixel_active,
+    ShaderVertexInputInfo& vertex_info, ShaderPixelInputInfo& pixel_info) {
 	const auto vertex_params = PrepareProgram(vertex_regs, sh, vertex_info);
 	ShaderParams pixel_params;
 	if (pixel_active) {
 		pixel_params = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
+		for (size_t slot = 0; slot < target_attachment.size(); slot++) {
+			pixel_info.target_attachment[slot] = target_attachment[slot];
+		}
 	}
 	if (context.GetClipControl().clip_disable) {
 		const auto& viewport = context.GetScreenViewport().viewports[0];
@@ -981,12 +985,17 @@ PipelineCache::GraphicsPipeline* PipelineCache::CreateGraphicsPipeline(
 	Common::LockGuard lock(m_mutex);
 	auto&             ctx = command.GetRegisters();
 
+	// A PS5 color target is written only where CB_TARGET_MASK and the pixel shader's CB_SHADER_MASK
+	// agree. Vulkan leaves an attachment undefined when the fragment shader has no output for it, so
+	// channels the shader does not export are masked out instead of staying write-enabled.
 	uint32_t color_mask[RENDER_COLOR_ATTACHMENTS_MAX] = {};
 	for (uint32_t i = 0; i < color_count; i++) {
 		color_mask[i] =
-		    (colors[i].image_id ? colors[i].export_mapping.ApplyMask(render_target_mask_slot(
-		                              ctx.GetRenderTargetMask(), colors[i].target_slot))
-		                        : 0);
+		    (colors[i].image_id
+		         ? colors[i].export_mapping.ApplyMask(render_target_write_mask_slot(
+		               ctx.GetRenderTargetMask(), ctx.GetShaderRegisters().m_cbShaderMask,
+		               colors[i].target_slot))
+		         : 0);
 	}
 	const HW::ModeControl& mc = ctx.GetModeControl();
 

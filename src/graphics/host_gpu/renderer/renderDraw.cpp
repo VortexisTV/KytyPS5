@@ -420,9 +420,12 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 #else
 	vk::Bool32 enable[RENDER_COLOR_ATTACHMENTS_MAX] = {};
 	// Color-control operation selects special color-buffer paths, not the normal component write
-	// mask. Attachment availability therefore follows the target write mask.
+	// mask. Attachment availability therefore follows the target write mask, limited to the
+	// channels the pixel shader exports (CB_SHADER_MASK), as the hardware combines both.
 	for (uint32_t i = 0; i < color_count; i++) {
-		enable[i] = render_target_mask_slot(ctx.GetRenderTargetMask(), colors[i].target_slot) != 0
+		enable[i] = render_target_write_mask_slot(ctx.GetRenderTargetMask(),
+		                                          ctx.GetShaderRegisters().m_cbShaderMask,
+		                                          colors[i].target_slot) != 0
 		                ? VK_TRUE
 		                : VK_FALSE;
 	}
@@ -1052,9 +1055,34 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw, bool
 	if (log_phases) {
 		LogDrawPhase(draw.name, "GetGraphicsPrograms");
 	}
+	// A pixel shader writes SV_Target N to render-target slot N, but only bound slots become Vulkan
+	// color attachments, packed in slot order, and Vulkan routes each output by attachment position.
+	// Give every bound slot its attachment and unbound slots the positions past the last one, so an
+	// output without a target is discarded instead of landing in a neighbouring target.
+	std::array<uint8_t, RENDER_COLOR_ATTACHMENTS_MAX> target_attachment {};
+	uint32_t                                          bound_slots = 0;
+	for (uint32_t i = 0; i < state.color_count; i++) {
+		const auto slot = state.color_info[i].target_slot;
+		EXIT_IF(slot >= RENDER_COLOR_ATTACHMENTS_MAX || (bound_slots & (1u << slot)) != 0);
+		target_attachment[slot] = static_cast<uint8_t>(i);
+		bound_slots |= 1u << slot;
+	}
+	auto spare_attachment = static_cast<uint8_t>(state.color_count);
+	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+		if ((bound_slots & (1u << slot)) == 0) {
+			target_attachment[slot] = spare_attachment++;
+		}
+	}
+	if (bound_slots + 1u != (1u << state.color_count)) {
+		static std::array<std::atomic_bool, 256> logged {};
+		if (!logged[bound_slots & 0xffu].exchange(true)) {
+			LOGF("MRT slots 0x%02x are not contiguous; pixel outputs remapped to packed attachments\n",
+			     bound_slots);
+		}
+	}
 	state.programs = pipeline_cache.GetGraphicsPrograms(
 	    vertex_shader_info, pixel_shader_info, shader_regs, ctx, target_export_mapping,
-	    state.ps_active, state.vs_input_info, state.ps_input_info);
+	    target_attachment, state.ps_active, state.vs_input_info, state.ps_input_info);
 }
 
 static PreparedVertexBuffers PrepareVertexBuffers(uint64_t submit_id, CommandBuffer& buffer,

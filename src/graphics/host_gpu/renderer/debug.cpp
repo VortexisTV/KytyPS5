@@ -23,6 +23,11 @@ uint32_t render_target_mask_slot(uint32_t mask, uint32_t slot) {
 	return (mask >> (slot * 4u)) & 0x0fu;
 }
 
+// A color channel is written only where CB_TARGET_MASK and the pixel shader's CB_SHADER_MASK agree.
+uint32_t render_target_write_mask_slot(uint32_t target_mask, uint32_t shader_mask, uint32_t slot) {
+	return render_target_mask_slot(target_mask & shader_mask, slot);
+}
+
 static bool RenderTargetMaskHasMrt(uint32_t mask) {
 	return (mask & ~0x0fu) != 0;
 }

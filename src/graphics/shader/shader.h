@@ -105,6 +105,9 @@ struct ShaderPixelInputInfo {
 	uint32_t                                       ps_perspective_center_vgpr   = UINT32_MAX;
 	uint8_t                                        target_output_mode[8]        = {};
 	std::array<Prospero::ColorComponentMapping, 8> target_export_mapping        = {};
+	// Color attachment position of each render-target slot: the output location of SV_Target N.
+	// Unbound slots take positions past the last attachment, so their writes are discarded.
+	std::array<uint8_t, 8>                         target_attachment = {0, 1, 2, 3, 4, 5, 6, 7};
 	uint32_t                                       scratch_size_dwords          = 0;
 	bool                                           ps_pos_x                     = false;
 	bool                                           ps_pos_y                     = false;

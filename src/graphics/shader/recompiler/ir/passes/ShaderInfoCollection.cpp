@@ -334,10 +334,18 @@ void CollectOutputs(const Program& program, const ShaderVertexInputInfo* vertex,
 					AddOutput(info, StageOutputKind::Parameter, export_info.index,
 					          export_info.index, fmt::format("out_param_{}", export_info.index));
 					break;
-				case ExportTargetKind::Mrt:
-					AddOutput(info, StageOutputKind::Mrt, export_info.index, export_info.index,
+				case ExportTargetKind::Mrt: {
+					// Bound render targets are packed into consecutive attachments, so the output
+					// location is the slot's attachment position rather than the slot number.
+					const uint32_t location =
+					    program.stage == ShaderType::Pixel &&
+					            export_info.index < pixel->target_attachment.size()
+					        ? pixel->target_attachment[export_info.index]
+					        : export_info.index;
+					AddOutput(info, StageOutputKind::Mrt, export_info.index, location,
 					          fmt::format("out_mrt_{}", export_info.index));
 					break;
+				}
 				default: break;
 			}
 		}

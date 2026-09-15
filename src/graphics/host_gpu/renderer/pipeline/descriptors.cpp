@@ -982,6 +982,45 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 	}
 }
 
+// A DMA read resolves its guest page through the BDA page table. A page no cached buffer covers reads
+// as zero and is registered only after the fault buffer is processed, so the first pass over newly
+// referenced memory consumes zeros. GTA V hands rasterized glyph bitmaps to its atlas blit shader as
+// a 64-bit pointer in user data; a glyph whose bitmap sits on an unseen page is blitted empty and the
+// game never redraws it. Cache the pages named by the user data that forms DMA address bases before
+// the shader runs.
+void RenderExecutor::PrepareDmaSources(const PreparedBindings& prepared) {
+	EXIT_IF(prepared.program == nullptr || prepared.snapshot == nullptr);
+	const auto& program = *prepared.program;
+	if (!program.info.uses_dma) {
+		return;
+	}
+	// Covers a glyph bitmap or a small record run; reads beyond it still take the fault path.
+	constexpr uint64_t SourceWindow = 256ull * 1024ull;
+	auto&              resources    = m_context.GetGpuResources();
+	auto&              cache        = m_context.GetBufferCache();
+	const auto&        user_data    = prepared.snapshot->user_data;
+	for (const auto reg: program.info.dma_address_registers) {
+		if (reg < program.user_data_base || reg - program.user_data_base + 1u >= user_data.size()) {
+			continue;
+		}
+		const auto index = reg - program.user_data_base;
+		const auto low   = user_data[index];
+		const auto high  = user_data[index + 1u];
+		// Guest GPU memory lies below 2^40. A value this close to a 4 GiB boundary is more likely a
+		// pair of small integers than a base, and caching the wrong range write-protects live pages.
+		if (high == 0 || high > 0xffu || low < 0x10000u) {
+			continue;
+		}
+		const uint64_t address = (static_cast<uint64_t>(high) << 32u) | low;
+		const uint64_t page    = address & ~(BufferCache::CACHING_PAGESIZE - 1u);
+		const uint64_t extent  = resources.MappedExtent(page, SourceWindow);
+		if (extent == 0) {
+			continue;
+		}
+		(void)cache.FindBuffer(page, extent);
+	}
+}
+
 void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.program == nullptr || prepared.snapshot == nullptr);
@@ -1087,6 +1126,10 @@ RenderExecutor::PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
 	}
 	if (bindings.vertex.program->info.uses_dma ||
 	    (bindings.pixel && bindings.pixel->program->info.uses_dma)) {
+		PrepareDmaSources(bindings.vertex);
+		if (bindings.pixel) {
+			PrepareDmaSources(*bindings.pixel);
+		}
 		m_context.GetGpuResources().PrepareBda();
 	}
 	RebindBuffers(bindings.vertex);
