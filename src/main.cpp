@@ -312,6 +312,7 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			if (!ParseBool(value, options.config.hot_page_tracking)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
+			}
 		} else if (arg == "--perf-stats") {
 			if (!ParseBool(value, options.config.perf_stats_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
