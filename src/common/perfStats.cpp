@@ -1,6 +1,5 @@
 #include "common/perfStats.h"
 
-#include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/timer.h"
 
@@ -384,7 +383,7 @@ void OnGuestFrame() noexcept {
 }
 
 void Initialize() {
-	if (!Config::PerfStatsEnabled() && !EnvironmentRequestsStats()) {
+	if (!EnvironmentRequestsStats()) {
 		return;
 	}
 	auto&           report = GetReport();

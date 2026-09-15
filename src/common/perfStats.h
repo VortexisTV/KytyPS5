@@ -8,9 +8,10 @@
 #include <string>
 
 // Per-interval performance statistics for finding the part of the emulator a slow scene loads.
-// Collection is off unless --perf-stats true or the environment variable KYTY_PERF_STATS=1 is
-// given, and a hook then costs one predictable branch. When on, a summary is printed after every
-// second of guest frames and each interval is appended as one row to _PerfStats.csv.
+// Collection is off unless the environment variable KYTY_PERF_STATS=1 is set.
+// When on, a summary is printed after every second of guest frames and each interval is 
+// appended as one row to _PerfStats.csv.
+
 namespace PerfStats {
 
 // Wall-clock time with an occurrence count and the longest single occurrence. Spans nest: the draw
