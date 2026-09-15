@@ -1,4 +1,5 @@
 #include "common/perfStats.h"
+#include "common/emulatorConfig.h"
 
 #include "common/file.h"
 #include "common/timer.h"
