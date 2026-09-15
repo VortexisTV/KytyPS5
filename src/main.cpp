@@ -70,6 +70,7 @@ static void PrintUsage() {
 	::printf("  --printf-direction <value>           Silent, Console, or File.\n");
 	::printf("  --printf-output-file <path>          Guest printf output file.\n");
 	::printf("  --profiler-direction <value>         None or Network.\n");
+	::printf("  --perf-stats <true|false>            Enable performance statistics collection.\n");
 	::printf("  --hot-pages <true|false>             Keep frequently rewritten GPU-visible pages\n"
 	         "                                       writable instead of faulting. Default: true.\n");
 	::printf("  --async-shaders <true|false>         Build graphics pipelines on worker threads and\n"
@@ -309,6 +310,10 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--hot-pages") {
 			if (!ParseBool(value, options.config.hot_page_tracking)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+		} else if (arg == "--perf-stats") {
+			if (!ParseBool(value, options.config.perf_stats_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}

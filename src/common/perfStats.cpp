@@ -383,7 +383,7 @@ void OnGuestFrame() noexcept {
 }
 
 void Initialize() {
-	if (!EnvironmentRequestsStats()) {
+	if (!Config::PerfStatsEnabled() && !EnvironmentRequestsStats()) {
 		return;
 	}
 	auto&           report = GetReport();

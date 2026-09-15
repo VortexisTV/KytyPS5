@@ -63,6 +63,7 @@ struct ConfigOptions {
 	OutputDirection        printf_direction            = OutputDirection::Silent;
 	std::filesystem::path  printf_output_file          = "_kyty.txt";
 	ProfilerDirection      profiler_direction          = ProfilerDirection::None;
+	bool                   perf_stats_enabled          = false;
 	bool                   spirv_debug_printf_enabled  = false;
 	bool                   gpu_assisted_validation_enabled = false;
 	bool                   renderdoc_enabled           = false;
@@ -103,6 +104,8 @@ OutputDirection       GetPrintfDirection();
 std::filesystem::path GetPrintfOutputFile();
 
 ProfilerDirection GetProfilerDirection();
+
+bool PerfStatsEnabled();
 
 bool SpirvDebugPrintfEnabled();
 

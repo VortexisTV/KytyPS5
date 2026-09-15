@@ -107,6 +107,10 @@ ProfilerDirection GetProfilerDirection() {
 	return g_config->profiler_direction;
 }
 
+bool PerfStatsEnabled() {
+    return g_config->perf_stats_enabled;
+}
+
 bool SpirvDebugPrintfEnabled() {
 	return g_config->spirv_debug_printf_enabled;
 }
