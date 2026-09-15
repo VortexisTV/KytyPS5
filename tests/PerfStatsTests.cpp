@@ -101,6 +101,11 @@ void TestSummaryReportsPerFrameValues() {
 	snapshot.spans[static_cast<size_t>(SpanId::BdaPrepare)] = {600, 40, 20};
 	snapshot.counters[static_cast<size_t>(CounterId::BdaBuffersVisited)] = 8000;
 	snapshot.counters[static_cast<size_t>(CounterId::BdaPassesSkipped)]  = 20;
+	snapshot.spans[static_cast<size_t>(SpanId::DrawShaders)]       = {400, 400, 5};
+	snapshot.spans[static_cast<size_t>(SpanId::ShaderPrepare)]     = {80, 400, 1};
+	snapshot.spans[static_cast<size_t>(SpanId::ShaderKey)]         = {40, 800, 1};
+	snapshot.spans[static_cast<size_t>(SpanId::ShaderMaterialize)] = {200, 760, 2};
+	snapshot.spans[static_cast<size_t>(SpanId::ShaderPermutation)] = {60, 760, 1};
 	const auto summary = PerfStats::FormatSummary(snapshot, 1000);
 	Check(summary.find("4 frames in 1.00s (4.0 fps)") != std::string::npos,
 	      "the summary does not report the frame rate");
@@ -109,6 +114,9 @@ void TestSummaryReportsPerFrameValues() {
 	Check(summary.find("BDA 10.0 passes 150.0 ms (5.0 skipped, 400 buffers per full pass)") !=
 	          std::string::npos,
 	      "the summary does not report per-frame BDA cost");
+	Check(summary.find("shader lookup 100.0 ms: prepare 20.0 ms, key 10.0 ms (200 lookups), "
+	                   "materialize 50.0 ms (190), permutation 15.0 ms") != std::string::npos,
+	      "the summary does not break down shader lookup");
 }
 
 } // namespace

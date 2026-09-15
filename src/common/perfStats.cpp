@@ -32,6 +32,8 @@ constexpr std::array<std::string_view, SpanCount> SpanNames = {
     "gpu_thread_busy",       "gpu_thread_idle",      "gpu_thread_blocked",
     "gpu_thread_commands",   "game_wait_gpu_idle",   "game_wait_gpu_command",
     "draw",                  "draw_targets",         "draw_shaders",
+    "shader_prepare",        "shader_key",           "shader_materialize",
+    "shader_permutation",
     "draw_bindings",         "draw_vertex_index",    "draw_pipeline",
     "draw_record",           "dispatch",             "bda_prepare",
     "buffer_download",       "queue_submit",         "gpu_wait",
@@ -279,6 +281,12 @@ std::string FormatSummary(const Snapshot& snapshot, uint64_t ticks_per_second) {
 	               per_frame(CounterId::DrawsSkippedShader),
 	               per_frame(CounterId::DrawsSkippedPipeline), count(SpanId::Dispatch),
 	               ms(SpanId::Dispatch));
+	fmt::format_to(it,
+	               "[perf] per frame: shader lookup {:.1f} ms: prepare {:.1f} ms, key {:.1f} ms ({:.0f} "
+	               "lookups), materialize {:.1f} ms ({:.0f}), permutation {:.1f} ms\n",
+	               ms(SpanId::DrawShaders), ms(SpanId::ShaderPrepare), ms(SpanId::ShaderKey),
+	               count(SpanId::ShaderKey), ms(SpanId::ShaderMaterialize),
+	               count(SpanId::ShaderMaterialize), ms(SpanId::ShaderPermutation));
 	fmt::format_to(it,
 	               "[perf] per frame: BDA {:.1f} passes {:.1f} ms ({:.1f} skipped, {:.0f} buffers per "
 	               "full pass) | {:.1f} submits {:.1f} ms | {:.1f} GPU waits {:.1f} ms (longest {:.1f} "

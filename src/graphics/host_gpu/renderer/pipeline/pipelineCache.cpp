@@ -447,6 +447,7 @@ struct PipelineCache::ProgramCache {
 	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info, uint32_t& push_data_cursor,
 	                  bool allow_async = true) {
 		constexpr ShaderType stage = StageOf<InputInfo>();
+		PerfStats::Span key_span(PerfStats::SpanId::ShaderKey);
 		if (enqueue) {
 			DrainCompleted();
 		}
@@ -465,10 +466,14 @@ struct PipelineCache::ProgramCache {
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		    .validate_memory_range      = ValidateShaderGuestMemoryRange,
 		};
+		key_span.Stop();
 		if (entry != programs.end()) {
 			auto& source = entry->second;
+			PerfStats::Span materialize_span(PerfStats::SpanId::ShaderMaterialize);
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(source.resource_plan, runtime,
 			                                                    resources, specialization));
+			materialize_span.Stop();
+			PerfStats::Span permutation_span(PerfStats::SpanId::ShaderPermutation);
 			const auto specialization_hash = HashSpecialization(specialization);
 			if (const auto permutation = std::ranges::find_if(
 			        source.permutations, [&](const Permutation& candidate) {
@@ -892,6 +897,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
     std::span<const uint8_t, 8> target_attachment, bool pixel_active,
     ShaderVertexInputInfo& vertex_info, ShaderPixelInputInfo& pixel_info) {
+	PerfStats::Span prepare_span(PerfStats::SpanId::ShaderPrepare);
 	const auto vertex_params = PrepareProgram(vertex_regs, sh, vertex_info);
 	ShaderParams pixel_params;
 	if (pixel_active) {
@@ -900,6 +906,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 			pixel_info.target_attachment[slot] = target_attachment[slot];
 		}
 	}
+	prepare_span.Stop();
 	if (context.GetClipControl().clip_disable) {
 		const auto& viewport = context.GetScreenViewport().viewports[0];
 		const auto& limits   = m_graphics.GetPhysicalDeviceProperties().limits;

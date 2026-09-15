@@ -15,7 +15,8 @@
 namespace PerfStats {
 
 // Wall-clock time with an occurrence count and the longest single occurrence. Spans nest: the draw
-// phases are part of Draw, and Draw, GpuWait and FlipWait are part of GpuThreadBusy.
+// phases are part of Draw, the shader phases are part of DrawShaders, and Draw, GpuWait and
+// FlipWait are part of GpuThreadBusy.
 enum class SpanId : uint8_t {
 	GpuThreadBusy,      // emulated GPU thread executing submissions or queued commands
 	GpuThreadIdle,      // emulated GPU thread waiting for work
@@ -26,6 +27,10 @@ enum class SpanId : uint8_t {
 	Draw,
 	DrawTargets,        // render-target resolution and attachment acquisition
 	DrawShaders,        // shader program lookup, including resource materialization
+	ShaderPrepare,      // vertex and pixel shader header and resource parsing
+	ShaderKey,          // static-state key and program table lookup; per stage, compute included
+	ShaderMaterialize,  // resource snapshot and specialization from guest memory; per stage
+	ShaderPermutation,  // specialization hash and compiled permutation search; per stage
 	DrawBindings,       // textures, samplers, storage buffers and DMA preparation
 	DrawVertexIndex,    // vertex and index buffer acquisition
 	DrawPipeline,       // graphics pipeline lookup or creation
