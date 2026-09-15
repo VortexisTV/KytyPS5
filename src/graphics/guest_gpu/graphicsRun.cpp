@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -139,6 +140,7 @@ void GuestGpu::ProcessCommands() {
 			m_commands.pop_front();
 			EXIT_IF(m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
 		}
+		PerfStats::Span span(PerfStats::SpanId::GpuThreadCommands);
 		command();
 	}
 }
@@ -154,6 +156,7 @@ void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 		operation();
 		done.release();
 	});
+	PerfStats::Span wait(PerfStats::SpanId::GameWaitGpuCommand);
 	done.acquire();
 }
 
@@ -201,6 +204,7 @@ void GuestGpu::SubmitFlipPreparation(uint64_t request_id) {
 void GuestGpu::Done() {
 	GpuMutexLock lock(m_submission_mutex);
 	if (!IsGpuThread()) {
+		PerfStats::Span wait(PerfStats::SpanId::GameWaitGpuIdle);
 		WaitForIdle();
 	}
 	m_graphics_done = true;
@@ -496,6 +500,7 @@ void GuestGpu::ThreadRun(void* data) {
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
+				PerfStats::Span idle(PerfStats::SpanId::GpuThreadIdle);
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
 			}
 			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
@@ -518,6 +523,7 @@ void GuestGpu::ThreadRun(void* data) {
 				}
 				if (selected_queue < 0) {
 					gpu->m_processing = false;
+					PerfStats::Span blocked(PerfStats::SpanId::GpuThreadBlocked);
 					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
 					for (auto& queue: gpu->m_queues) {
 						if (!queue.empty()) {
@@ -544,7 +550,11 @@ void GuestGpu::ThreadRun(void* data) {
 
 		if (command) {
 			EXIT_IF(g_current_processor != nullptr);
+			PerfStats::Span busy(PerfStats::SpanId::GpuThreadBusy);
+			PerfStats::Span commands(PerfStats::SpanId::GpuThreadCommands);
 			command();
+			commands.Stop();
+			busy.Stop();
 
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			gpu->m_processing = false;
@@ -555,7 +565,9 @@ void GuestGpu::ThreadRun(void* data) {
 		}
 
 		EXIT_IF(!has_submission);
+		PerfStats::Span busy(PerfStats::SpanId::GpuThreadBusy);
 		const bool complete = gpu->Process(submission);
+		busy.Stop();
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
 		if (!complete) {
@@ -1181,6 +1193,7 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index) {
 	BufferFlush();
 
+	PerfStats::Span wait(PerfStats::SpanId::FlipWait);
 	m_renderer.GetVideoOut().WaitFlipDone(static_cast<int>(video_out_handle),
 	                                      static_cast<int>(display_buffer_index));
 }
