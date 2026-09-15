@@ -2,7 +2,6 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
-#include "common/perfStats.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -138,14 +137,6 @@ std::pair<uint64_t, uint64_t> BufferCache::DownloadEnvelope(const DownloadCopy& 
 }
 
 void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies) {
-	PerfStats::Span span(PerfStats::SpanId::BufferDownload);
-	if (PerfStats::Enabled()) {
-		uint64_t bytes = 0;
-		for (const auto& copy: copies) {
-			bytes += copy.size;
-		}
-		PerfStats::Add(PerfStats::CounterId::BufferDownloadBytes, bytes);
-	}
 	std::vector<DownloadCopy> batch;
 	batch.reserve(copies.size());
 	uint64_t                  packed_size = 0;
@@ -420,7 +411,6 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 		DeleteBuffer(old_id);
 	}
 	Register(id);
-	PerfStats::Add(PerfStats::CounterId::BufferCreates);
 	return id;
 }
 
@@ -437,8 +427,6 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	    },
 	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
 	if (source) {
-		PerfStats::Add(PerfStats::CounterId::BufferUploads);
-		PerfStats::Add(PerfStats::CounterId::BufferUploadBytes, total_size);
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
 		const auto native = command.Handle();
@@ -516,8 +504,6 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
 		if (mapped != nullptr && Libs::LibKernel::Memory::TryReadBacking(vaddr, mapped, size)) {
 			m_stream_buffer.Commit();
-			PerfStats::Add(PerfStats::CounterId::StreamUploads);
-			PerfStats::Add(PerfStats::CounterId::StreamUploadBytes, size);
 			return {&m_stream_buffer, offset};
 		}
 	}
@@ -831,9 +817,6 @@ void BufferCache::RunGarbageCollector() {
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
-	PerfStats::Set(PerfStats::GaugeId::GpuMemoryMb, m_total_used_memory >> 20u);
-	PerfStats::Set(PerfStats::GaugeId::BufferGcTriggerMb, m_trigger_gc_memory >> 20u);
-	PerfStats::Set(PerfStats::GaugeId::CachedBuffers, m_buffers.size());
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
@@ -872,7 +855,6 @@ void BufferCache::RunGarbageCollector() {
 		} else {
 			m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
 			DeleteBuffer(id);
-			PerfStats::Add(PerfStats::CounterId::BuffersEvicted);
 		}
 		return ++retire_count == limit;
 	});
@@ -893,7 +875,6 @@ void BufferCache::RunGarbageCollector() {
 		Unregister(id);
 		m_slot_buffers.erase(id);
 	}
-	PerfStats::Add(PerfStats::CounterId::BuffersEvicted, dirty_buffers.size());
 }
 
 void BufferCache::ProcessFaultBuffer() {
@@ -901,7 +882,6 @@ void BufferCache::ProcessFaultBuffer() {
 }
 
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
-	uint64_t visited = 0;
 	const auto end = vaddr + size;
 	auto       it  = m_buffers.upper_bound(vaddr);
 	if (it != m_buffers.begin()) {
@@ -913,10 +893,8 @@ void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
 		const auto finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
 		if (start < finish) {
 			(void)SynchronizeBuffer(buffer, start, finish - start, false, false);
-			visited++;
 		}
 	}
-	PerfStats::Add(PerfStats::CounterId::BdaBuffersVisited, visited);
 }
 
 } // namespace Libs::Graphics

@@ -2,7 +2,6 @@
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
-#include "common/perfStats.h"
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -774,7 +773,6 @@ RenderContext& Presenter::Renderer() const noexcept {
 
 void Presenter::Present(Frame& frame, bool reuse) {
 	KYTY_PROFILER_FUNCTION();
-	PerfStats::Span span(PerfStats::SpanId::Present);
 	m_impl->frames.ValidateForPresent(&frame, reuse);
 
 	const auto ime_visual = GetImeVisualState();

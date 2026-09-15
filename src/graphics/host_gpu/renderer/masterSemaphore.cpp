@@ -1,8 +1,6 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 
 #include "common/assert.h"
-#include "common/perfStats.h"
-#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 namespace Libs::Graphics {
@@ -48,8 +46,6 @@ void MasterSemaphore::Wait(uint64_t tick) {
 		return;
 	}
 
-	// Waits on the priority-operation and present threads do not hold up command processing.
-	PerfStats::Span span(PerfStats::SpanId::GpuWait, GuestGpu::IsGpuThread());
 	vk::SemaphoreWaitInfo wait_info {};
 	wait_info.sType          = vk::StructureType::eSemaphoreWaitInfo;
 	wait_info.semaphoreCount = 1;

@@ -1,7 +1,6 @@
 #include "graphics/host_gpu/renderer/cache/gpuResourceManager.h"
 
 #include "common/assert.h"
-#include "common/perfStats.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
@@ -22,9 +21,6 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 	if (!IsMapped(fault_vaddr, fault_size)) {
 		return false;
 	}
-	PerfStats::Span span(PerfStats::SpanId::PageFault);
-	PerfStats::Add(access == PageFaultAccess::Write ? PerfStats::CounterId::WriteFaults
-	                                                : PerfStats::CounterId::ReadFaults);
 	if (access == PageFaultAccess::Write) {
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
@@ -96,7 +92,6 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size) {
 }
 
 void GpuResourceManager::PrepareBda() {
-	PerfStats::Span span(PerfStats::SpanId::BdaPrepare);
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
 		m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
@@ -105,7 +100,6 @@ void GpuResourceManager::PrepareBda() {
 }
 
 void GpuResourceManager::RunGarbageCollector() {
-	PerfStats::Span span(PerfStats::SpanId::GarbageCollect);
 	RegionManager::AdvanceGeneration();
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;

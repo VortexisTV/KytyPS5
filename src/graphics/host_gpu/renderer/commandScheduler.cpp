@@ -2,7 +2,6 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
-#include "common/perfStats.h"
 #include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
 
@@ -390,7 +389,6 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 }
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
-	PerfStats::Span span(PerfStats::SpanId::QueueSubmit);
 	EXIT_IF(m_command.IsInvalid());
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
