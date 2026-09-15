@@ -86,7 +86,7 @@ void TestCsvRowsMatchHeader() {
 	Check(Columns(header) == Columns(row), "CSV row and header column counts differ");
 	Check(header.find(",draw_ms,draw_n,draw_max_ms,") != std::string::npos,
 	      "span columns are missing from the CSV header");
-	Check(header.find(",bda_buffers_visited,") != std::string::npos,
+	Check(header.find(",bda_buffers_visited,bda_passes_skipped,") != std::string::npos,
 	      "counter columns are missing from the CSV header");
 	Check(header.find(",cached_buffers\n") != std::string::npos,
 	      "gauge columns are missing from the CSV header");
@@ -100,12 +100,14 @@ void TestSummaryReportsPerFrameValues() {
 	snapshot.spans[static_cast<size_t>(SpanId::Draw)]       = {1000, 400, 10};
 	snapshot.spans[static_cast<size_t>(SpanId::BdaPrepare)] = {600, 40, 20};
 	snapshot.counters[static_cast<size_t>(CounterId::BdaBuffersVisited)] = 8000;
+	snapshot.counters[static_cast<size_t>(CounterId::BdaPassesSkipped)]  = 20;
 	const auto summary = PerfStats::FormatSummary(snapshot, 1000);
 	Check(summary.find("4 frames in 1.00s (4.0 fps)") != std::string::npos,
 	      "the summary does not report the frame rate");
 	Check(summary.find("100 draws 250.0 ms") != std::string::npos,
 	      "the summary does not report per-frame draw cost");
-	Check(summary.find("BDA 10.0 passes 150.0 ms (200 buffers per pass)") != std::string::npos,
+	Check(summary.find("BDA 10.0 passes 150.0 ms (5.0 skipped, 400 buffers per full pass)") !=
+	          std::string::npos,
 	      "the summary does not report per-frame BDA cost");
 }
 

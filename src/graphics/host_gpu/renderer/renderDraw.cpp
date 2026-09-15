@@ -4,6 +4,7 @@
 #include "common/common.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -1223,16 +1224,23 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	auto& ucfg = buffer.GetUserConfig();
 
 	LogDrawPhase(draw.name, "PrepareBindings");
+	PerfStats::Span bindings_span(PerfStats::SpanId::DrawBindings);
 	auto& bindings = PrepareGraphicsBindings(state.vs_input_info.stage, state.ps_input_info.stage,
 	                                         state.ps_active);
+	bindings_span.Stop();
+	PerfStats::Span vertex_index_span(PerfStats::SpanId::DrawVertexIndex);
 	auto vertex_bindings = PrepareVertexBuffers(submit_id, buffer, draw, state.vs_input_info);
 	auto index_binding   = PrepareIndexBuffer(buffer, index_source);
+	vertex_index_span.Stop();
+	PerfStats::Span acquire_targets_span(PerfStats::SpanId::DrawTargets);
 	state.rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info);
+	acquire_targets_span.Stop();
 
 	if (log_pipeline_phase) {
 		LogDrawPhase(draw.name, "CreatePipeline");
 	}
+	PerfStats::Span pipeline_span(PerfStats::SpanId::DrawPipeline);
 	const auto&                      regs = buffer.GetRegisters();
 	const PipelinePointerCache::Key  pipeline_key {
 	    .rt_version        = regs.GetRenderTargetVersion(),
@@ -1259,8 +1267,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			m_pipeline_pointer_cache.pipeline = pipeline_ptr;
 		}
 	}
+	pipeline_span.Stop();
 	if (pipeline_ptr == nullptr) {
 		// The pipeline is still compiling on a worker; this draw is dropped for the frame.
+		PerfStats::Add(PerfStats::CounterId::DrawsSkippedPipeline);
 		return;
 	}
 	auto& pipeline = *pipeline_ptr;
@@ -1268,6 +1278,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
 	// memory.
+	PerfStats::Span record_span(PerfStats::SpanId::DrawRecord);
 	auto vk_buffer = buffer.Handle();
 	if (set_bind_debug) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x100u);
@@ -1327,6 +1338,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                const DrawIndexArgs& args) {
 	KYTY_PROFILER_FUNCTION();
+	PerfStats::Span draw_span(PerfStats::SpanId::Draw);
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
@@ -1428,15 +1440,20 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	index_source.type = index_type;
 
 	DrawRenderState state {};
+	PerfStats::Span targets_span(PerfStats::SpanId::DrawTargets);
 	if (!PrepareDrawRenderState(submit_id, buffer, draw, args.render_target_slice_offset, true,
 	                            state)) {
 		ResetBindings();
 		return;
 	}
+	targets_span.Stop();
 
+	PerfStats::Span shaders_span(PerfStats::SpanId::DrawShaders);
 	RefreshShaders(buffer, draw, true, state);
+	shaders_span.Stop();
 	if (!state.programs.vertex || (state.ps_active && !state.programs.pixel)) {
 		// A shader is still being translated on a worker; drop this draw for the frame.
+		PerfStats::Add(PerfStats::CounterId::DrawsSkippedShader);
 		ResetBindings();
 		return;
 	}
@@ -1464,6 +1481,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args) {
 	KYTY_PROFILER_FUNCTION();
+	PerfStats::Span draw_span(PerfStats::SpanId::Draw);
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
@@ -1514,20 +1532,25 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	                         args.vertex_count, args.instance_count, args.first_instance};
 
 	DrawRenderState state {};
+	PerfStats::Span targets_span(PerfStats::SpanId::DrawTargets);
 	if (!PrepareDrawRenderState(submit_id, buffer, draw, args.render_target_slice_offset, false,
 	                            state)) {
 		ResetBindings();
 		return;
 	}
+	targets_span.Stop();
 
 	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
 	if (!GetDrawTopology(ucfg, true, topology)) {
 		ResetBindings();
 		return;
 	}
+	PerfStats::Span shaders_span(PerfStats::SpanId::DrawShaders);
 	RefreshShaders(buffer, draw, false, state);
+	shaders_span.Stop();
 	if (!state.programs.vertex || (state.ps_active && !state.programs.pixel)) {
 		// A shader is still being translated on a worker; drop this draw for the frame.
+		PerfStats::Add(PerfStats::CounterId::DrawsSkippedShader);
 		ResetBindings();
 		return;
 	}

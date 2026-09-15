@@ -31,7 +31,7 @@ enum class SpanId : uint8_t {
 	DrawPipeline,       // graphics pipeline lookup or creation
 	DrawRecord,         // descriptor commit, dynamic state and draw recording
 	Dispatch,
-	BdaPrepare,         // synchronizing every cached buffer before a DMA draw or dispatch
+	BdaPrepare,         // synchronizing cached buffers for a DMA draw or dispatch (or skipping it)
 	BufferDownload,     // GPU-to-guest buffer readback, including the GPU drain
 	QueueSubmit,
 	GpuWait,            // emulated GPU thread blocked on host GPU completion
@@ -51,6 +51,7 @@ enum class CounterId : uint8_t {
 	DrawsSkippedShader,
 	DrawsSkippedPipeline,
 	BdaBuffersVisited,
+	BdaPassesSkipped, // BDA preparations with nothing new to upload since the last complete pass
 	BufferUploads,
 	BufferUploadBytes,
 	StreamUploads, // small CPU-modified bindings copied into the stream buffer

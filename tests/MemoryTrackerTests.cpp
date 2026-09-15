@@ -785,6 +785,57 @@ void TestFullRegionGpuUnmarkBatching() {
   Release(page_manager, memory, region_size * 2);
 }
 
+void TestUploadEpochTracksNewUploadWork() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto &page_manager = harness.page_manager;
+  const auto page_size = page_manager.GetPageSize();
+  auto *memory = Allocate(page_manager, 2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  uint32_t ranges = 0;
+  const auto count_ranges = [&](uint64_t, uint64_t) noexcept { ranges++; };
+  const auto upload = []() noexcept {};
+
+  auto epoch = tracker.UploadEpoch();
+  Check(tracker.IsRegionCpuModified(address, page_size) &&
+            tracker.UploadEpoch() != epoch,
+        "a new CPU-dirty region did not advance the upload epoch");
+  tracker.ForEachUploadRange(address, page_size * 2, false, count_ranges,
+                             upload);
+  epoch = tracker.UploadEpoch();
+  ranges = 0;
+  tracker.ForEachUploadRange(address, page_size * 2, false, count_ranges,
+                             upload);
+  Check(ranges == 0 && tracker.UploadEpoch() == epoch,
+        "an upload with nothing to copy advanced the upload epoch");
+
+  tracker.MarkRegionAsCpuModified(address + 16, 32);
+  Check(tracker.UploadEpoch() != epoch,
+        "a page turning CPU-dirty did not advance the upload epoch");
+  epoch = tracker.UploadEpoch();
+  tracker.MarkRegionAsCpuModified(address, page_size);
+  tracker.InvalidateRegion(address + 64, 16, [] {});
+  Check(tracker.UploadEpoch() == epoch,
+        "re-marking a CPU-dirty page advanced the upload epoch");
+  tracker.InvalidateRegion(address + page_size + 16, 16, [] {});
+  Check(tracker.UploadEpoch() != epoch,
+        "invalidating a clean page did not advance the upload epoch");
+
+  epoch = tracker.UploadEpoch();
+  Libs::Graphics::RegionManager::AdvanceGeneration();
+  Check(tracker.UploadEpoch() != epoch,
+        "a new submission generation did not advance the upload epoch");
+  epoch = tracker.UploadEpoch();
+  tracker.ClearHotPages(address, page_size * 2);
+  Check(tracker.UploadEpoch() != epoch,
+        "resetting hot pages did not advance the upload epoch");
+  epoch = tracker.UploadEpoch();
+  tracker.UntrackMemory(address, page_size * 2);
+  Check(tracker.UploadEpoch() != epoch,
+        "untracking memory did not advance the upload epoch");
+  Release(page_manager, memory, page_size * 2);
+}
+
 [[noreturn]] void RunDeathCase(const char *name) {
   TrackerHarness harness;
   auto &tracker = harness.tracker;
@@ -883,6 +934,7 @@ int main(int argc, char **argv) {
   TestDownloadDoesNotSerializeDisjointRegion();
   TestGpuUnmarkUsesRegionMask();
   TestFullRegionGpuUnmarkBatching();
+  TestUploadEpochTracksNewUploadWork();
   TestFatalPaths();
   Config::Shutdown();
   std::puts("MemoryTrackerTests: all cases passed");

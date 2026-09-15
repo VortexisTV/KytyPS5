@@ -95,6 +95,13 @@ public:
 		const auto& bits        = GetBits<source>();
 		return RegionBits(bits, start, end).Any();
 	}
+	template <DirtySource source>
+	[[nodiscard]] bool IsFullyModified(uint64_t offset, uint64_t size) const {
+		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
+		RegionBits range;
+		range.SetRange(start, end);
+		return (range & ~GetBits<source>()).None();
+	}
 
 	// How an upload treats pages that the CPU rewrites every frame ("hot"). A hot page is left
 	// dirty and writable so it never faults again; instead it is re-uploaded at most once per
@@ -105,6 +112,9 @@ public:
 	// Global submission generation; advanced once per completed GPU submission.
 	static void AdvanceGeneration() noexcept {
 		s_generation.fetch_add(1, std::memory_order_relaxed);
+	}
+	[[nodiscard]] static uint64_t Generation() noexcept {
+		return s_generation.load(std::memory_order_relaxed);
 	}
 
 	// Forget hot state for pages leaving the cache or joining a new host buffer. The stored

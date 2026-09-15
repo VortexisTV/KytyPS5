@@ -42,6 +42,7 @@ constexpr std::array<std::string_view, SpanCount> SpanNames = {
 
 constexpr std::array<std::string_view, CounterCount> CounterNames = {
     "draws_skipped_shader", "draws_skipped_pipeline", "bda_buffers_visited",
+    "bda_passes_skipped",
     "buffer_uploads",       "buffer_upload_bytes",    "stream_uploads",
     "stream_upload_bytes",  "buffer_creates",         "buffer_download_bytes",
     "buffers_evicted",      "image_creates",          "image_uploads",
@@ -238,7 +239,10 @@ std::string FormatSummary(const Snapshot& snapshot, uint64_t ticks_per_second) {
 		return static_cast<double>(snapshot.Get(id)) / frames;
 	};
 	const auto mb = [&](CounterId id) { return Megabytes(snapshot.Get(id)) / frames; };
-	const auto bda_passes = snapshot.Get(SpanId::BdaPrepare).count;
+	// A skipped preparation is timed like a pass but visits no buffers.
+	const auto bda_requests = snapshot.Get(SpanId::BdaPrepare).count;
+	const auto bda_passes =
+	    bda_requests - std::min(snapshot.Get(CounterId::BdaPassesSkipped), bda_requests);
 	const auto buffers_per_pass =
 	    bda_passes == 0 ? 0.0
 	                    : static_cast<double>(snapshot.Get(CounterId::BdaBuffersVisited)) /
@@ -276,11 +280,12 @@ std::string FormatSummary(const Snapshot& snapshot, uint64_t ticks_per_second) {
 	               per_frame(CounterId::DrawsSkippedPipeline), count(SpanId::Dispatch),
 	               ms(SpanId::Dispatch));
 	fmt::format_to(it,
-	               "[perf] per frame: BDA {:.1f} passes {:.1f} ms ({:.0f} buffers per pass) | {:.1f} submits "
-	               "{:.1f} ms | {:.1f} GPU waits {:.1f} ms (longest {:.1f} ms) | {:.1f} page faults "
-	               "{:.1f} ms ({:.1f} write) | GC {:.1f} ms\n",
+	               "[perf] per frame: BDA {:.1f} passes {:.1f} ms ({:.1f} skipped, {:.0f} buffers per "
+	               "full pass) | {:.1f} submits {:.1f} ms | {:.1f} GPU waits {:.1f} ms (longest {:.1f} "
+	               "ms) | {:.1f} page faults {:.1f} ms ({:.1f} write) | GC {:.1f} ms\n",
 	               count(SpanId::BdaPrepare), ms(SpanId::BdaPrepare),
-	               buffers_per_pass, count(SpanId::QueueSubmit),
+	               per_frame(CounterId::BdaPassesSkipped), buffers_per_pass,
+	               count(SpanId::QueueSubmit),
 	               ms(SpanId::QueueSubmit), count(SpanId::GpuWait), ms(SpanId::GpuWait),
 	               Milliseconds(snapshot.Get(SpanId::GpuWait).max_ticks, ticks_per_second),
 	               count(SpanId::PageFault), ms(SpanId::PageFault),
